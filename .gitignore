@@ -1,0 +1,20 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local app state
+data/state.json
+data/profile.json
+
+# OpenClaw local state
+.openclaw/
+
+# OS/editor
+.DS_Store
+.vscode/

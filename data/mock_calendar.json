@@ -1,0 +1,11 @@
+{
+  "title": "Meeting at SUTD",
+  "start": "2026-09-10T16:00:00+08:00",
+  "location": "SUTD",
+  "attendees": [
+    {
+      "name": "Sarah",
+      "email": "sarah@example.com"
+    }
+  ]
+}

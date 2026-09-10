@@ -1,0 +1,16 @@
+{
+  "preferred_transport": "public_transport",
+  "travel_minutes": 45,
+
+  "buffers": {
+    "early_arrival_minutes": 10,
+    "invisible_delay_minutes": 8,
+    "prep_minutes": 15,
+    "task_switch_minutes": 10
+  },
+
+  "location": {
+    "label": "Home",
+    "confirmed_at": "2026-09-10T12:30:00+08:00"
+  }
+}
