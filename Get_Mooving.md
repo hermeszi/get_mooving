@@ -1,6 +1,6 @@
 # Get Mooving
 
-**ADHD-Friendly Meeting Travel & Transition Agent**  
+**ADHD-Friendly Singapore Meeting Travel & Transition Agent**  
 
 > **Project theme:** OpenClaw agent + messaging app communication demo  
 > **Scope key:** Build/demo scope first. Future ideas should not block the 3-day MVP.
