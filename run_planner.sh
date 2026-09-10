@@ -2,4 +2,5 @@
 set -e
 
 cd "$(dirname "$0")"
-python3 src/planner.py
+
+./.venv/bin/python3 src/planner.py

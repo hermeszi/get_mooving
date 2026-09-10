@@ -1,11 +1,11 @@
 ---
-name: get-mooing
+name: get-mooving
 description: Help the user prepare and leave on time for their next appointment.
 ---
 
-# Get Mooing Workflow
+# Get Mooving Workflow
 
-When the user asks when they should leave:
+When the user asks when they should leave, or about their next meeting or departure plan:
 
 1. Read the next appointment from the available calendar source.
 2. Determine:
@@ -15,28 +15,40 @@ When the user asks when they should leave:
 3. Check the user's current or last-confirmed starting location.
 4. If the location is stale, missing, or uncertain, ask the user to confirm it.
 5. Get or use the travel duration.
-6. Run the project's deterministic planner script:
+6. You MUST run the project's deterministic planner script:
 
-   ./run_planner.sh
+   /home/ming/42/openclaw/get_mooving/run_planner.sh
 
-7. Use the planner output as the source of truth for calculated times.
-8. Do not recalculate times yourself.
-9. Present the result using short ADHD-friendly prompts:
+7. The script output is the ONLY source of truth for:
+   - event title
+   - destination
+   - meeting time
+   - wrap-up time
+   - get-ready time
+   - leave-prompt time
+   - physical departure time
+   - arrival time
+8. Never use example values from this file.
+9. Never reuse times from an earlier conversation.
+10. Never calculate or infer these times yourself.
+11. Present the exact script output using short ADHD-friendly wording:
 
-   - ⏳ Wrap up
-   - 🎒 Get ready
-   - 🚪 Leave now
-   - 🚇 MRT
-   - 🚕 Taxi
+    - ⏳ Wrap up
+    - 🎒 Get ready
+    - 🚪 Leave now
+    - 🚇 MRT
+    - 🚕 Taxi
 
-10. Prefer concrete actions over abstract time-only language.
+12. Prefer concrete actions over abstract time-only language.
+13. If the script fails, say that the planner could not be run. Do not guess.
+14. If the script reports that the event has no location set, ask the user for the destination. Do not guess or invent one, and do not run the planner again until a destination is available.
 
 Example:
 
-⏳ 1:29 PM — Finish what you are doing. Do not start another task.  
-🎒 1:39 PM — Pack your things and get ready.  
-🚪 1:54 PM — Leave now.  
-🚇 Expected arrival: about 2:50 PM.
+⏳  — Finish what you are doing. Do not start another task.  
+🎒  — Pack your things and get ready.  
+🚪  — Leave now.  
+🚇 Expected arrival: about  .
 
 # Late Recovery
 

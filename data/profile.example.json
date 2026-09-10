@@ -1,6 +1,5 @@
 {
   "preferred_transport": "public_transport",
-  "travel_minutes": 45,
 
   "buffers": {
     "early_arrival_minutes": 10,
@@ -11,6 +10,7 @@
 
   "location": {
     "label": "Home",
-    "confirmed_at": "2026-09-10T12:30:00+08:00"
+    "address": "2 Ang Mo Kio Street 21, Singapore 569384",
+    "confirmed_at": "2026-09-11T12:30:00+08:00"
   }
 }

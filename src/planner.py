@@ -2,6 +2,9 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from calendar_google import get_next_event
+from onemap import search_location, get_public_transport_time
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
@@ -79,16 +82,60 @@ def print_plan(plan: dict, event: dict) -> None:
 
 
 def main():
-    event = load_json("mock_calendar.json")
+    event = get_next_event()
     profile = load_json("profile.json")
+
+    if not event:
+        print("No upcoming timed events found.")
+        return
+
+    if not event.get("location"):
+        print(
+            f"'{event['title']}' has no location set. "
+            "Cannot calculate travel time without a destination."
+        )
+        return
 
     meeting_time = datetime.fromisoformat(event["start"])
 
     buffers = profile["buffers"]
 
+    start_location = search_location(
+        profile["location"]["address"])
+
+    destination = search_location(
+        event["location"])
+
+    #do one rough estimate
+    rough_departure = meeting_time - timedelta(
+        minutes=buffers["early_arrival_minutes"] + 60)
+
+    travel_minutes = get_public_transport_time(
+        start_location,
+        destination,
+        rough_departure,
+    )
+
+    #first plan
     plan = calculate_plan(
         meeting_time=meeting_time,
-        travel_minutes=profile["travel_minutes"],
+        travel_minutes=travel_minutes,
+        early_arrival_minutes=buffers["early_arrival_minutes"],
+        invisible_delay_minutes=buffers["invisible_delay_minutes"],
+        prep_minutes=buffers["prep_minutes"],
+        task_switch_minutes=buffers["task_switch_minutes"],
+        )
+
+    #again with the actual departure time
+    travel_minutes = get_public_transport_time(
+        start_location,
+        destination,
+        plan["physical_departure"],
+    )
+
+    plan = calculate_plan(
+        meeting_time=meeting_time,
+        travel_minutes=travel_minutes,
         early_arrival_minutes=buffers["early_arrival_minutes"],
         invisible_delay_minutes=buffers["invisible_delay_minutes"],
         prep_minutes=buffers["prep_minutes"],

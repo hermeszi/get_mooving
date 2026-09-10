@@ -1,0 +1,196 @@
+import os
+import math
+import requests
+import re
+
+from datetime import datetime
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+ONEMAP_TOKEN = os.getenv("ONEMAP_TOKEN")
+
+SEARCH_URL = "https://www.onemap.gov.sg/api/common/elastic/search"
+ROUTE_URL = "https://www.onemap.gov.sg/api/public/routingsvc/route"
+
+
+def get_headers():
+    if not ONEMAP_TOKEN:
+        raise RuntimeError("ONEMAP_TOKEN is missing from .env")
+
+    return {
+        "Authorization": ONEMAP_TOKEN
+    }
+
+def search_location(query: str) -> dict:
+    """
+    Convert an address/building name/postal code into coordinates.
+
+    Try the full query first.
+    If that fails, try a Singapore 6-digit postal code found in the text.
+    """
+
+    queries = [query]
+
+    # Find Singapore postal code, e.g. 308232
+    postal_match = re.search(r"\b\d{6}\b", query)
+
+    if postal_match:
+        postal_code = postal_match.group()
+
+        if postal_code not in queries:
+            queries.append(postal_code)
+
+    for search_query in queries:
+
+        params = {
+            "searchVal": search_query,
+            "returnGeom": "Y",
+            "getAddrDetails": "Y",
+            "pageNum": 1,
+        }
+
+        response = requests.get(
+            SEARCH_URL,
+            headers=get_headers(),
+            params=params,
+            timeout=10,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if data.get("error"):
+            raise RuntimeError(data["error"])
+
+        results = data.get("results", [])
+
+        if results:
+            result = results[0]
+
+            return {
+                "address": result["ADDRESS"],
+                "postal": result.get("POSTAL"),
+                "latitude": float(result["LATITUDE"]),
+                "longitude": float(result["LONGITUDE"]),
+            }
+
+    raise ValueError(f"Location not found: {query}")
+
+# def search_location(query: str) -> dict:
+#     """
+#     Convert an address/building name/postal code into coordinates.
+#     """
+
+#     params = {
+#         "searchVal": query,
+#         "returnGeom": "Y",
+#         "getAddrDetails": "Y",
+#         "pageNum": 1,
+#     }
+
+#     response = requests.get(
+#         SEARCH_URL,
+#         headers=get_headers(),
+#         params=params,
+#         timeout=10,
+#     )
+
+#     response.raise_for_status()
+
+#     data = response.json()
+
+#     if data.get("error"):
+#         raise RuntimeError(data["error"])
+
+#     results = data.get("results", [])
+
+#     if not results:
+#         raise ValueError(f"Location not found: {query}")
+
+#     result = results[0]
+
+#     return {
+#         "address": result["ADDRESS"],
+#         "latitude": float(result["LATITUDE"]),
+#         "longitude": float(result["LONGITUDE"]),
+#     }
+
+
+def get_public_transport_time(
+    start: dict,
+    destination: dict,
+    departure_time: datetime,
+) -> int:
+    """
+    Return public-transport journey time in minutes.
+    """
+
+    params = {
+        "start": f"{start['latitude']},{start['longitude']}",
+        "end": (
+            f"{destination['latitude']},"
+            f"{destination['longitude']}"
+        ),
+        "routeType": "pt",
+        "mode": "TRANSIT",
+        "date": departure_time.strftime("%m-%d-%Y"),
+        "time": departure_time.strftime("%H:%M:%S"),
+        "maxWalkDistance": 1000,
+        "numItineraries": 1,
+    }
+
+    response = requests.get(
+        ROUTE_URL,
+        headers=get_headers(),
+        params=params,
+        timeout=15,
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    # OneMap PT responses normally contain itineraries.
+    itineraries = data.get("plan", {}).get("itineraries", [])
+
+    if itineraries:
+        seconds = itineraries[0]["duration"]
+        return math.ceil(seconds / 60)
+
+    # Useful fallback if the response uses route_summary.
+    route_summary = data.get("route_summary")
+
+    if route_summary and "total_time" in route_summary:
+        return math.ceil(route_summary["total_time"] / 60)
+
+    raise RuntimeError(
+        f"Could not find journey duration in OneMap response: {data}"
+    )
+
+
+if __name__ == "__main__":
+    start = search_location("SUTD")
+
+    destination = search_location("308232")
+
+    print("START:")
+    print(start)
+
+    print("\nDESTINATION:")
+    print(destination)
+
+    departure = datetime.fromisoformat(
+        "2026-09-11T13:30:00+08:00"
+    )
+
+    minutes = get_public_transport_time(
+        start,
+        destination,
+        departure,
+    )
+
+    print()
+    print(f"🚇 Estimated journey: {minutes} minutes")
