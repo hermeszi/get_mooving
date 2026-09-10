@@ -12,6 +12,10 @@ __pycache__/
 data/state.json
 data/profile.json
 
+# Google API credentials
+credentials.json
+token.json
+
 # OpenClaw local state
 .openclaw/
 
