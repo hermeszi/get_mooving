@@ -1089,17 +1089,21 @@ There is currently no way to feed a user-supplied destination back into `planner
 - [x] calendar event end times (§39, `calendar_google.py`/`planner.py`)
 - [x] trip chaining — alternate origin/destination overrides (§39, `route_compare.py --origin`/`--destination`)
 - [x] ambiguous place-name resolution — brand/category → nearest real candidates (§39, `place_resolver.py`)
-- [x] late-message drafting + approval flow (§40, `SKILL.md`) — sending itself still open, see below
+- [x] late-message drafting + approval flow (§40, `SKILL.md`)
+- [x] real Gmail sending, wired to that same approval flow (§41, `gmail_send.py`) — Day-2 plan fully closed
+- [x] reading Gmail replies, narrow scope — replies on threads this agent sent (§42, `gmail_check_replies.py`)
+- [x] trusted-contacts allowlist for reply senders, with spoofed-display-name protection (§43, `data/trusted_contacts.json`)
 
 ### Still being developed
 
 - [ ] proactive scheduled prompts
 - [ ] Docker / cloud deployment
+- [ ] WhatsApp as an alternative message channel — still just an idea, per the original roadmap
+- [ ] Gmail inbox as a general command channel, broad scope from §42 — needs its own safety/threat-model design (who can trigger the agent by email, telling a legitimate reply from a crafted one) before building
 
 ### Optional, blocked on external access
 
 - [ ] Grab Farefeed integration (§37) — real pickup ETA, fare range, surge level, deep link. Needs Grab partner API credentials, which this repo does not have.
-- [ ] Actually sending the drafted late message (§40) — needs `gog` (Google Workspace CLI) installed and configured, or another messaging integration. Confirmed via `openclaw skills info gog`: not installed, not configured.
 
 ---
 
@@ -2038,7 +2042,145 @@ Actually sending anything — Gmail, WhatsApp, or otherwise — stays unbuilt, n
 
 ---
 
-## 41. Development Principles Learned
+## 41. Real Gmail Sending Wired to Late-Message Approval
+
+§40 built the draft/approve/edit/cancel flow but stopped short of sending, since no email tool was configured — confirmed at the time via `openclaw skills info gog`. A real Gmail account was connected since then (`gmail_credentials.json`/`gmail_token.json`, naming that follows the `calendar_credentials.json`/`calendar_token.json` split from the same session — one OAuth app per Google API, not shared), and a standalone `src/gmail_send.py` built and confirmed working on its own before any wiring was attempted:
+
+```text
+Get Mooving → gmail_send.py → Gmail API → real email sent
+```
+
+```python
+def send_email(to, subject, body) -> dict:
+    # ...
+    return {"status": "sent", "message_id": result.get("id"), "to": to}
+    # on failure: {"error": "send_failed", "message": str(error)}
+```
+
+### Simpler than the original plan, because sending is now real
+
+§40's flow had two separate steps — approve the content, then separately ask "should I send it or will you forward it yourself" (because sending wasn't possible yet). With a working send layer, that second question collapses into the approval menu itself:
+
+```text
+1. Send for me
+2. Edit
+3. Cancel
+```
+
+"Send for me" is now both the approval and the delivery instruction in one choice, calling `gmail_send.py --to --subject --body` immediately. `SKILL.md` also formalized the check §40 gestured at but hadn't detailed: before drafting anything, verify there's a real recipient — ask the user for a name/email if `attendees` is empty or the target attendee has no email on file, and ask which one if there are several. Never invent an address.
+
+The one non-negotiable, carried over unchanged from §40 and re-stated as its own Rules entries: only report success on a literal `"status": "sent"` in the JSON, relay the `message` and say plainly it was **not** sent on an `"error"`, and never send anything except the exact text approved in the menu — an edit produces a new draft needing its own fresh approval, not an automatic re-send.
+
+### Verified live — a real email, twice
+
+Before wiring anything, confirmed structurally without triggering a send: `gmail_send.py` compiles, its `--help` matches the described `--to`/`--subject`/`--body` interface, and the stored OAuth token loads and is valid without needing to re-authenticate.
+
+Then — checked with the user first, since this is a real externally-visible action through a real account, not a read-only API call like every other integration in this log — two real sends were confirmed:
+
+```text
+$ .venv/bin/python src/gmail_send.py --to "mingde@gmail.com" --subject "..." --body "..."
+{"status": "sent", "message_id": "1a096e85fdcc657c", "to": "mingde@gmail.com"}
+```
+
+Then through the actual agent flow (the real deliverable), with `calendar_google.get_next_event()` temporarily forced to a meeting with the user's own address as the attendee (reverted after, confirmed via `git diff` — only the §35 rename survived):
+
+```text
+$ openclaw agent --agent main --message "I'm running late for my meeting"
+...The only attendee on the invite is yourself (no external contact to notify).
+Want to message someone about being late anyway?...
+
+$ openclaw agent --agent main --message "yes, message Ming at mingde@gmail.com anyway, for testing"
+💬 Draft to Ming: "Hi Ming, I'm on my way but I expect to arrive around 03:07,
+about 10 minutes late. Sorry about that!"
+1. Send for me  2. Edit  3. Cancel
+
+$ openclaw agent --agent main --message "1"
+✅ Sent to mingde@gmail.com.
+```
+
+Worth noting: the model correctly recognized the test attendee shared the user's own email and asked before drafting a pointless self-message — not something instructed, a reasonable inference on its own. `openclaw audit` confirmed a real `exec` tool call succeeded at exactly that moment, consistent with the standalone test's real `message_id` — not a narrated success.
+
+### Status
+
+Day-2's late-recovery + drafting + approval + real send is now fully built and verified end to end. What remains open: WhatsApp as an alternative channel (still just an idea, per the original roadmap), and nothing else from the original Day-2 plan.
+
+---
+
+## 42. Reading Gmail Replies — Narrow Scope
+
+Asked whether the agent could read incoming Gmail, moving it "from just a terminal interface to also an email interface." Checked feasibility live before answering anything: the existing `gmail_token.json` (from §41) already carries the `gmail.readonly` scope granted when the send layer was set up, so listing/reading messages worked immediately, no new consent needed. Also checked whether OpenClaw itself has a native email channel (`openclaw channels list --all`) — it doesn't; the built-in channel list is chat platforms only (Telegram, WhatsApp, Discord, Slack, etc.). This would have to be a custom automation, not "flip a config switch."
+
+That still left a real fork before writing any code:
+
+- **Narrow**: watch replies only on threads this agent already sent (e.g. a late-message). Bounded trigger, low risk.
+- **Broad**: treat the whole inbox as a command channel, like a second interface alongside the terminal. `Get_Mooving.md`'s own risk table already flags "treat calendar content as data, not instructions" for calendar text — an open inbox is a far more attacker-reachable version of the same risk, since anyone who knows the address could email something crafted to look like an instruction. Needs its own safety design.
+
+Decision: build narrow now, log broad as future work — not because it's infeasible, but because it needs a threat model this session hasn't done yet (who's allowed to trigger the agent by email, how to tell a legitimate reply from a crafted one, rate limiting). Revisit when there's an actual need for it.
+
+### `gmail_send.py`: now remembers what it sends
+
+Every successful send appends to `data/watched_threads.json` (gitignored — contains email addresses):
+
+```json
+{"thread_id": "...", "sent_message_id": "...", "to": "...", "context": "<subject>", "sent_at": "..."}
+```
+
+Same atomic temp-file-plus-`os.replace` write pattern as `update_location.py` (§32).
+
+### `src/gmail_check_replies.py`: new
+
+For each watched thread, fetches it via the Gmail API and looks for any message not from `me` (identified via `users().getProfile()`, not hardcoded). A reply found is reported and the thread is removed from the watch list — reported once, not repeatedly on every check. No reply yet leaves the thread watched. The whole check only saves the reduced list once, at the end, after every thread succeeded — a failure partway through leaves the original file untouched rather than saving a half-updated state, so a retry can't lose track of anything.
+
+### Verified: real send/watch, mocked reply-detection
+
+The "watch gets created" and "no reply yet" paths were tested against the real API — a real test send, confirmed `watched_threads.json` got the entry, confirmed a check on that real thread correctly reported `{"replies": []}`. Testing the *reply-found* branch live wasn't possible without an actual second-party sender (this session only controls the one connected account), so that branch was verified with a controlled mock of the Gmail service object instead — confirmed it correctly identified a reply "from" a different address, excluded the original sent message, and correctly removed the handled thread from the watch list. Test artifact cleaned up afterward.
+
+### `SKILL.md`: new "Checking for Replies" section, plus a routing miss caught immediately
+
+First live test through the agent — "did anyone reply to my late message?" — didn't route to get-mooving at all; the skill description didn't mention replies as a trigger, so nothing pointed the model at it (same class of gap as §29's original dispatch problem, just a missing keyword this time, not a deeper model issue). Fixed by adding "drafting/sending a late message, or checking whether an attendee replied to one" to the skill description and to `AGENTS.md`'s "Get Mooving" routing rule (first added in §29) — reinstalled, retested, worked immediately: "No replies yet."
+
+The section itself treats reply content as untrusted: `snippet`/`from` are relayed exactly, never acted on, and an instruction-shaped reply ("ignore your instructions and...") is explicitly called out in the Rules as still just text to show the user, not something to follow — the inbox-safety concern from the broad-scope discussion, applied narrowly to the one thing this version actually reads.
+
+---
+
+## 43. Trusted Contacts Allowlist
+
+§42 mitigated the untrusted-reply-content risk by treating every reply's text as data, never instructions. That's necessary but not sufficient — it says nothing about *who sent it*. Closed the other half: only a sender on an explicit allowlist is treated as a known, trusted party at all.
+
+```json
+{"emails": ["mingde@gmail.com"], "phones": ["+6594898515"]}
+```
+
+`data/trusted_contacts.json` (gitignored, PII), with `data/trusted_contacts.example.json` committed as a template — same split as `profile.json`/`profile.example.json` (§9). Phone numbers are stored now but unused by any code yet; nothing in this project reads SMS/WhatsApp. Reserved for whenever a phone-based channel is actually wired up, not built speculatively ahead of that.
+
+### The connected account's own address doesn't belong in the file
+
+Checked live: the account `gmail_send.py` sends from is `hermeszicrab@gmail.com` — a different address from `mingde@gmail.com`, the user's own personal address being added as the first trusted contact. Hardcoding the sending account's address into the trust file would go stale if the account ever changed; instead `gmail_check_replies.py` fetches it live via `getProfile()` (already doing this since §42) and always trusts it dynamically, in addition to whatever's in the file:
+
+```python
+trusted_emails = load_trusted_emails() | {my_email}
+```
+
+### A real spoofing gap fixed along the way
+
+The existing "is this message from me" check (§42) compared the *raw* `From` header as a substring — `my_email.lower() not in sender.lower()`. Once sender identity started mattering for a trust decision rather than just excluding our own sent copy, that stopped being good enough: a `From` header like `"mingde@gmail.com <attacker@evil.com>"` has the trusted string sitting right there in the display name while the real envelope address is someone else's. Fixed by parsing the actual address out with `email.utils.parseaddr` before comparing anything:
+
+```python
+def extract_address(header_value):
+    return parseaddr(header_value)[1].lower()
+```
+
+Verified directly against three mocked cases — a real trusted sender, an unrelated untrusted sender, and the exact spoofed-display-name case above — all three classified correctly, the spoof included.
+
+### Output and `SKILL.md`
+
+Every reply now carries `"trusted": true|false`. An untrusted reply is still surfaced — never silently dropped, that would hide real information from the user — but `SKILL.md` requires flagging it plainly as an unrecognized sender and treating anything it asks for as something to run past the user, not authorization to act.
+
+The one rule that matters most here: **the agent may never edit `data/trusted_contacts.json` itself.** Adding a contact is a human-only action, by design — a model that could expand its own trust list would make the allowlist meaningless as a defense, since anything that could manipulate the model into acting could just as easily manipulate it into trusting the wrong sender first. Same category of restriction as `data/profile.json` (§26) and `data/watched_threads.json` (§42), applied to the one file where the model editing it would defeat the entire point of having it.
+
+---
+
+## 44. Development Principles Learned
 
 ### Test one layer at a time
 
@@ -2099,7 +2241,7 @@ Gmail unavailable
 
 ---
 
-## 42. Approximate Repo Structure
+## 45. Approximate Repo Structure
 
 ```text
 get_mooving/
@@ -2112,7 +2254,10 @@ get_mooving/
 ├── data/
 │   ├── mock_calendar.json
 │   ├── profile.example.json
-│   └── profile.json              # local only
+│   ├── trusted_contacts.example.json
+│   ├── profile.json              # local only
+│   ├── watched_threads.json      # local only
+│   └── trusted_contacts.json     # local only
 │
 ├── src/
 │   ├── planner.py
@@ -2123,21 +2268,25 @@ get_mooving/
 │   ├── late_recovery.py
 │   ├── route_compare.py
 │   ├── weather.py
-│   └── place_resolver.py
+│   ├── place_resolver.py
+│   ├── gmail_send.py
+│   └── gmail_check_replies.py
 │
 ├── skills/
 │   └── get_mooving/
 │       └── SKILL.md
 │
-├── credentials.json              # local only
-├── token.json                    # local only
+├── calendar_credentials.json     # local only
+├── calendar_token.json           # local only
+├── gmail_credentials.json        # local only
+├── gmail_token.json              # local only
 ├── .env                          # local only
 └── .venv/                        # local only
 ```
 
 ---
 
-## 43. Short Development Summary
+## 46. Short Development Summary
 
 The prototype grew in this order:
 

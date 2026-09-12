@@ -9,8 +9,8 @@ from googleapiclient.discovery import build
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-CREDENTIALS_FILE = BASE_DIR / "credentials.json"
-TOKEN_FILE = BASE_DIR / "token.json"
+CREDENTIALS_FILE = BASE_DIR / "calendar_credentials.json"
+TOKEN_FILE = BASE_DIR / "calendar_token.json"
 
 SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly"

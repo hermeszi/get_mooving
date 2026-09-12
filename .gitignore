@@ -11,10 +11,14 @@ __pycache__/
 # Local app state
 data/state.json
 data/profile.json
+data/watched_threads.json
+data/trusted_contacts.json
 
 # Google API credentials
-credentials.json
-token.json
+calendar_credentials.json
+calendar_token.json
+gmail_credentials.json
+gmail_token.json
 
 # OpenClaw local state
 .openclaw/
