@@ -1,9 +1,11 @@
+import argparse
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from calendar_google import get_next_event
 from onemap import search_location, get_public_transport_time
+from location_state import is_location_fresh, location_confirmation_prompt
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -60,6 +62,24 @@ def format_time(dt: datetime) -> str:
     return dt.strftime("%-I:%M %p")
 
 
+def format_24h(dt: datetime) -> str:
+    return dt.strftime("%H:%M")
+
+
+def build_result(event: dict, plan: dict, transport: str) -> dict:
+    return {
+        "event": event["title"],
+        "destination": event["location"],
+        "meeting_time": format_24h(plan["meeting_time"]),
+        "arrival_target": format_24h(plan["arrival_target"]),
+        "wrap_up": format_24h(plan["wrap_up_prompt"]),
+        "get_ready": format_24h(plan["get_ready_prompt"]),
+        "leave_prompt": format_24h(plan["leave_prompt"]),
+        "physical_departure": format_24h(plan["physical_departure"]),
+        "transport": transport,
+    }
+
+
 def print_plan(plan: dict, event: dict) -> None:
     print()
     print(f"📅 {event['title']}")
@@ -82,17 +102,43 @@ def print_plan(plan: dict, event: dict) -> None:
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the plan (or any failure) as JSON instead of text.",
+    )
+    args = parser.parse_args()
+
+    def emit_error(reason: str, message: str, **extra) -> None:
+        if args.json:
+            print(json.dumps({"error": reason, "message": message, **extra}))
+        else:
+            print(message)
+
     event = get_next_event()
     profile = load_json("profile.json")
 
     if not event:
-        print("No upcoming timed events found.")
+        emit_error("no_upcoming_event", "No upcoming timed events found.")
         return
 
     if not event.get("location"):
-        print(
+        emit_error(
+            "no_destination",
             f"'{event['title']}' has no location set. "
-            "Cannot calculate travel time without a destination."
+            "Cannot calculate travel time without a destination.",
+            event=event["title"],
+        )
+        return
+
+    location = profile["location"]
+
+    if not is_location_fresh(location.get("confirmed_at"), datetime.now().astimezone()):
+        emit_error(
+            "location_confirmation_required",
+            location_confirmation_prompt(location["label"]),
+            label=location["label"],
         )
         return
 
@@ -100,8 +146,7 @@ def main():
 
     buffers = profile["buffers"]
 
-    start_location = search_location(
-        profile["location"]["address"])
+    start_location = search_location(location["address"])
 
     destination = search_location(
         event["location"])
@@ -142,7 +187,10 @@ def main():
         task_switch_minutes=buffers["task_switch_minutes"],
     )
 
-    print_plan(plan, event)
+    if args.json:
+        print(json.dumps(build_result(event, plan, profile["preferred_transport"])))
+    else:
+        print_plan(plan, event)
 
 
 if __name__ == "__main__":

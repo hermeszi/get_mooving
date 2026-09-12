@@ -1058,7 +1058,7 @@ There is currently no way to feed a user-supplied destination back into `planner
 - [x] OpenClaw installed on Linux
 - [x] Gateway configured and running
 - [x] OpenRouter API key
-- [x] fixed Qwen model
+- [x] fixed Qwen model (superseded — see §29, Step 5: swapped to `openrouter/anthropic/claude-sonnet-4.6` after Qwen3 30B proved unreliable at skill/tool dispatch)
 - [x] Python virtual environment
 - [x] deterministic `planner.py`
 - [x] mock Calendar data
@@ -1074,18 +1074,19 @@ There is currently no way to feed a user-supplied destination back into `planner
 - [x] integrated local planner
 - [x] OpenClaw can explicitly execute the full planner
 - [x] clean failure when an event has no location
+- [x] automatic Get Mooving skill selection (works on `claude-sonnet-4.6`; see §29)
+- [x] normal prompt → planner execution without explicitly saying "use exec" (same fix)
+- [x] location freshness / confirmation (§30, `location_state.py`)
+- [x] structured planner output (§31, `planner.py --json`)
 
 ### Still being developed
 
-- [ ] automatic Get Mooving skill selection
-- [ ] normal prompt → planner execution without explicitly saying "use exec"
-- [ ] location freshness / confirmation
 - [ ] destination override input, so an answer to "where is it?" can reach `planner.py`
+- [ ] location confirmation input, so a 1/2/3 answer can reach `planner.py` (same shape as above; §31 recommends a small `update_location.py` script over letting the LLM edit JSON directly)
 - [ ] proactive scheduled prompts
 - [ ] `late` recovery
 - [ ] alternative transport comparison
 - [ ] Gmail late-message drafting + approval
-- [ ] structured planner output
 - [ ] Docker / cloud deployment
 
 ---
@@ -1128,7 +1129,309 @@ Agent:
 
 ---
 
-## 29. Development Principles Learned
+## 29. Skill Dispatch Failure Diagnosed
+
+Testing the target flow from §28 (plain user message → skill → exec) surfaced the exact break point.
+
+### Step 1 — routing rule added
+
+A persistent operating rule was added to OpenClaw's `AGENTS.md` (`~/.openclaw/workspace/AGENTS.md`), since that file is loaded at session startup for every agent:
+
+```text
+## Get Mooving
+
+For questions about the user's next meeting, meeting location,
+when to leave, travel/departure plans, getting ready, or being late:
+always use the get-mooving skill before answering.
+Never answer these from conversation memory.
+```
+
+The skill description was also tightened from a generic sentence to a trigger-specific one:
+
+```text
+description: Use for next meeting, meeting location, when to leave,
+travel/departure plans, transition timing, or running late.
+```
+
+Both were reinstalled with `openclaw skills install ./skills/get_mooving --as get-mooving --force` and `openclaw gateway restart`.
+
+### Step 2 — confirmed the routing rule works
+
+`openclaw skills check --agent main` showed `get-mooving` fully `eligible`, `modelVisible`, and `commandVisible` — no config problem.
+
+On the **old, already-open session**, a plain message still got no attempt at all:
+
+```text
+$ openclaw agent --agent main --message "Where is my next meeting?"
+> I can't access your calendar to check your next meeting location...
+```
+
+AGENTS.md is only read at session startup, so a mid-session edit does not retroactively apply — matches the refresh cycle already documented in §13. After `openclaw agent --agent main --message "/new"`, the same plain message changed behavior:
+
+```text
+$ openclaw agent --agent main --message "Where is my next meeting?"
+> I can't use the tool "get-mooving" here because it isn't available.
+> I need to stop retrying it and answer without that tool.
+```
+
+This is progress: the model now *attempts* to use get-mooving on a plain natural-language question. The routing fix works.
+
+### Step 3 — the real break: a hallucinated tool call
+
+`journalctl --user -u openclaw-gateway.service` showed what actually happens underneath. Two different failure modes were caught, depending on how the skill was invoked:
+
+Forcing it with `/skill get-mooving ...` made the model call the wrong meta-tool:
+
+```text
+[tools] skill_workshop failed: Skill Workshop can only update skills
+it generated. No Workshop-generated skill matched: get-mooving.
+Create it as a new skill, or edit the file directly.
+raw_params={"action":"read","skill_name":"get-mooving"}
+```
+
+Forcing it with `$get-mooving ...`, or letting the model choose it naturally after the AGENTS.md fix, made it try to call a tool literally named `get-mooving`, which does not exist — it retried this silently (~10 model round-trips, ~50 seconds) before giving up:
+
+```text
+I can't use the tool "get-mooving" here because it isn't available.
+I need to stop retrying it and answer without that tool.
+```
+
+Per OpenClaw's own docs (`docs.openclaw.ai/tools/skills`), this is a model mistake, not a config problem: "Eligible skills are compiled into a compact XML block and injected into the system prompt." A skill is instruction text, not a tool with its own name — the model is supposed to read it and then call its normal tools (`exec`) per what it says. There is no tool called `get-mooving` to call.
+
+An explicit line was added to `SKILL.md` to rule this out as a wording problem:
+
+```text
+This is not a callable tool. There is no tool named "get-mooving" —
+do not try to call one. Follow these instructions directly using
+your normal tools (exec) to run the script below.
+```
+
+Reinstalled, gateway restarted, fresh session, same message — identical failure. So this is not fixable by rewording the skill.
+
+### Step 4 — the exec path itself still works perfectly
+
+As a sanity check, the exact instruction style from §25 was re-run:
+
+```text
+$ openclaw agent --agent main --message "Use the exec tool to run \
+/home/ming/42/openclaw/get_mooving/run_planner.sh. Return the stdout \
+exactly and do not calculate anything yourself."
+
+> Your next meeting is at:
+> 📅 Coding class
+> 📍 22 Havelock Rd, Singapore 160022
+> Meeting time: 11:00 AM  Recommended arrival: 10:50 AM
+> ⏳ Wrap up: 9:39 AM  🎒 Get ready: 9:49 AM  🚪 Leave: 10:04 AM
+> Latest recommended departure: 10:12 AM
+```
+
+Live, correct data for a real upcoming event. The full pipeline is confirmed sound end to end:
+
+```text
+OpenClaw → exec tool → run_planner.sh → planner.py
+              ├→ calendar_google.py
+              └→ onemap.py
+```
+
+### Step 5 — model swap confirms the diagnosis
+
+The suspicion in the original conclusion (tool-selection weakness in the configured cheap model, not a bug in this repo) was tested directly by switching the model:
+
+```bash
+openclaw models set openrouter/anthropic/claude-sonnet-4.6
+```
+
+This changes the permanent agent config (confirmed via `openclaw agents list` → `Model: openrouter/anthropic/claude-sonnet-4.6`), not a one-off `--model` override.
+
+Result, same plain message, same fresh-session flow that failed under Qwen3 30B:
+
+```text
+Qwen3 30B:
+  skill/tool dispatch unreliable
+  → hallucinated "get-mooving" tool call, retried, gave up
+
+Claude Sonnet 4.6:
+  plain request → skill → exec → live planner
+  → succeeded
+```
+
+This confirms the pipeline, `SKILL.md`, and the `AGENTS.md` routing rule were never the problem. The break was entirely inside Qwen3 30B's tool-selection behavior when a skill needed to be turned into a real tool call. A more capable model does this correctly on the first plain-language request, with no special phrasing required.
+
+### Conclusion
+
+The gap was narrow and precisely located: getting from "the model has decided to use get-mooving" to "therefore call `exec` with this path," without the model inventing a fictitious `get-mooving` tool call in between. §7 chose Qwen3 30B for cost; that tradeoff is what broke skill dispatch. Swapping to `openrouter/anthropic/claude-sonnet-4.6` resolved it outright — the cost/reliability tradeoff needs revisiting if Qwen3 stays the default for anything beyond simple, non-tool-calling replies.
+
+Options still on the table if a cheaper model is wanted back later:
+
+- OpenClaw's `command-dispatch: tool` / `command-tool: exec` front-matter option, which bypasses model tool-selection entirely — but only for the explicit `/get-mooving` slash-command path, not plain natural language.
+- Reporting the hallucinated-tool-call behavior upstream, now reproduced and confirmed model-specific.
+
+---
+
+## 30. Location Freshness
+
+The last remaining Day-1 feature from `Get_Mooving.md`'s design was closed: `profile.json` already stored `confirmed_at`, but nothing checked it. `planner.py` used `profile["location"]["address"]` unconditionally, so a stale or ancient location would be silently fed into OneMap without ever asking the user.
+
+### `src/location_state.py`
+
+A small standalone module, deliberately kept out of `planner.py` rather than adding another branch to `main()`:
+
+```text
+profile.json
+      ↓
+location_state.py
+      ↓
+   recent?
+   │
+   ├── YES → use address
+   │
+   └── NO  → confirmation prompt
+```
+
+MVP rule, kept intentionally simple:
+
+```python
+FRESHNESS_LIMIT = timedelta(hours=2)
+
+def is_location_fresh(confirmed_at, now):
+    if not confirmed_at:
+        return False
+    confirmed_time = datetime.fromisoformat(confirmed_at)
+    return now - confirmed_time < FRESHNESS_LIMIT
+```
+
+confirmed < 2 hours ago → use it. Older or missing → ask.
+
+### Wired into `planner.py`
+
+The check runs right after the event-location check, before any OneMap call:
+
+```python
+location = profile["location"]
+
+if not is_location_fresh(location.get("confirmed_at"), datetime.now().astimezone()):
+    print(location_confirmation_prompt(location["label"]))
+    return
+```
+
+Output when stale (this is what `profile.json`'s real `confirmed_at` produced, since it was over a day old):
+
+```text
+$ ./run_planner.sh
+📍 Still starting from Home?
+1 Yes · 2 Home · 3 Somewhere else
+```
+
+Verified all three cases directly against `planner.main()`:
+
+- fresh `confirmed_at` (10 minutes old) → normal plan output, unchanged.
+- stale `confirmed_at` (>2h) → confirmation prompt, no OneMap calls made.
+- missing `confirmed_at` → same confirmation prompt.
+
+### Skill-level wiring
+
+A new rule was added to `SKILL.md`, mirroring the existing missing-destination rule from §26:
+
+```text
+15. If the script asks whether the user is still starting from a
+location (a 📍 confirmation prompt), relay that question to the user
+exactly, with the numbered options. Do not guess or assume an answer,
+and do not run the planner again until the user confirms.
+```
+
+Reinstalled with `openclaw skills install ./skills/get_mooving --as get-mooving --force` and `openclaw gateway restart`.
+
+### Known gap (same shape as §26)
+
+There is still no way to feed the user's answer (1/2/3) back into `planner.py` — it only ever reads `profile.json`'s stored `confirmed_at`. Answering the prompt today would need someone to manually update `data/profile.json`. Closing this is the same deferred work as the destination-override gap: an input path from the agent back into the deterministic script. Not built yet.
+
+---
+
+## 31. Structured JSON Output
+
+Even with §29's model fix, `planner.py` was still printing formatted human text, which the LLM had to re-read and could in principle reinterpret or mistype (this is exactly the failure mode §14 warned about: "the LLM started reinterpreting planner output and generated incorrect derived times"). Text output leaves that door open no matter how good the model is. A `--json` mode closes it structurally.
+
+### `planner.py --json`
+
+Success output, matching the field names decided up front:
+
+```json
+{"event": "Coding class", "destination": "22 Havelock Rd, Singapore 160022", "meeting_time": "11:00", "arrival_target": "10:50", "wrap_up": "09:39", "get_ready": "09:49", "leave_prompt": "10:04", "physical_departure": "10:12", "transport": "public_transport"}
+```
+
+Built by two small additions, no change to the actual arithmetic:
+
+```python
+def format_24h(dt):
+    return dt.strftime("%H:%M")
+
+def build_result(event, plan, transport):
+    return {
+        "event": event["title"],
+        "destination": event["location"],
+        "meeting_time": format_24h(plan["meeting_time"]),
+        "arrival_target": format_24h(plan["arrival_target"]),
+        "wrap_up": format_24h(plan["wrap_up_prompt"]),
+        "get_ready": format_24h(plan["get_ready_prompt"]),
+        "leave_prompt": format_24h(plan["leave_prompt"]),
+        "physical_departure": format_24h(plan["physical_departure"]),
+        "transport": transport,
+    }
+```
+
+The three existing failure paths (§26 missing destination, §30 stale location, plus "no upcoming event") were also converted to structured JSON under `--json`, instead of the plain messages they printed before:
+
+```json
+{"error": "no_upcoming_event", "message": "No upcoming timed events found."}
+{"error": "no_destination", "message": "'...' has no location set...", "event": "..."}
+{"error": "location_confirmation_required", "message": "📍 Still starting from Home?\n1 Yes · 2 Home · 3 Somewhere else", "label": "Home"}
+```
+
+Text mode (no flag) is unchanged and still the default — `--json` is opt-in.
+
+`run_planner.sh` now forwards arguments (`"$@"`) so `./run_planner.sh --json` reaches the script.
+
+### `SKILL.md` updated to use it
+
+Step 6 now runs `run_planner.sh --json` instead of the plain form. The three separate failure rules from §26/§30 (missing destination, stale location, generic script failure) were collapsed into one generic rule, since the skill no longer needs to know the specific error shapes — it just relays whatever `message` says:
+
+```text
+14. If the JSON output contains an "error" field, relay its "message"
+value to the user exactly (do not guess or invent a location,
+destination, or time), and do not run the planner again until the
+user has resolved the underlying issue.
+```
+
+Reinstalled with `openclaw skills install ./skills/get_mooving --as get-mooving --force` and `openclaw gateway restart`.
+
+### Verified
+
+All four cases tested directly against `planner.main()` with `--json` (success, no event, no destination, stale location) — each produced the expected JSON shape.
+
+Then tested live, on a fresh session, on `claude-sonnet-4.6` (the model swap from §29):
+
+```text
+$ openclaw agent --agent main --message "Where is my next meeting?"
+
+Coding class at 22 Havelock Rd, Singapore 160022 — 11:00 AM
+⏳ Wrap up      09:39 — finish what you're doing, don't start anything new
+🎒 Get ready    09:49 — pack up and head out
+🚪 Leave        10:04 — out the door
+🚇 Depart       10:12 — on the train/bus
+🏁 Arrive       10:50 — 10 min buffer before 11:00
+```
+
+Every time value matches the raw `--json` output for the same event exactly. The model reworded; it did not recompute. This is the architecture rule from §7 ("The LLM should not calculate departure times") now enforced structurally rather than only by instruction.
+
+### Open design question: how should the user's answer get back in?
+
+§26 and §30 both flagged the same unclosed gap: there is no way for an answer to "where is it?" or "still starting from Home?" to reach back into `planner.py` — someone has to edit `data/profile.json` by hand. The question of whether to close this by having the LLM edit the JSON files directly, or by adding a small deterministic `update_location.py` (structured args in, address validated through `onemap.search_location`, `confirmed_at` set to the real current time, atomic write out) was raised and not yet decided to build.
+
+Recommendation reached: a small script, not direct LLM edits. The reasoning is the same one behind every other decision in this log — an LLM doing a mechanically precise task (a correct ISO-8601 timestamp, valid JSON structure, not clobbering unrelated fields) is exactly the failure mode this project keeps designing around (§29 showed a cheap model getting far simpler mechanics wrong). Not built yet.
+
+---
+
+## 32. Development Principles Learned
 
 ### Test one layer at a time
 
@@ -1189,7 +1492,7 @@ Gmail unavailable
 
 ---
 
-## 30. Approximate Repo Structure
+## 33. Approximate Repo Structure
 
 ```text
 get_mooving/
@@ -1207,7 +1510,8 @@ get_mooving/
 ├── src/
 │   ├── planner.py
 │   ├── calendar_google.py
-│   └── onemap.py
+│   ├── onemap.py
+│   └── location_state.py
 │
 ├── skills/
 │   └── get_mooving/
@@ -1221,7 +1525,7 @@ get_mooving/
 
 ---
 
-## 31. Short Development Summary
+## 34. Short Development Summary
 
 The prototype grew in this order:
 

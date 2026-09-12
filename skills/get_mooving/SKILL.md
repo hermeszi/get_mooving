@@ -1,9 +1,11 @@
 ---
 name: get-mooving
-description: Help the user prepare and leave on time for their next appointment.
+description: Use for next meeting, meeting location, when to leave, travel/departure plans, transition timing, or running late.
 ---
 
 # Get Mooving Workflow
+
+This is not a callable tool. There is no tool named "get-mooving" — do not try to call one. Follow these instructions directly using your normal tools (exec) to run the script below.
 
 When the user asks when they should leave, or about their next meeting or departure plan:
 
@@ -15,11 +17,19 @@ When the user asks when they should leave, or about their next meeting or depart
 3. Check the user's current or last-confirmed starting location.
 4. If the location is stale, missing, or uncertain, ask the user to confirm it.
 5. Get or use the travel duration.
-6. You MUST run the project's deterministic planner script:
+6. You MUST run the project's deterministic planner script in JSON mode:
 
-   /home/ming/42/openclaw/get_mooving/run_planner.sh
+   /home/ming/42/openclaw/get_mooving/run_planner.sh --json
 
-7. The script output is the ONLY source of truth for:
+   This prints one JSON object on success:
+
+   {"event": ..., "destination": ..., "meeting_time": ..., "arrival_target": ..., "wrap_up": ..., "get_ready": ..., "leave_prompt": ..., "physical_departure": ..., "transport": ...}
+
+   or one JSON object with an "error" field on failure:
+
+   {"error": "<reason>", "message": "<human-readable text>", ...}
+
+7. The JSON output is the ONLY source of truth for:
    - event title
    - destination
    - meeting time
@@ -30,8 +40,8 @@ When the user asks when they should leave, or about their next meeting or depart
    - arrival time
 8. Never use example values from this file.
 9. Never reuse times from an earlier conversation.
-10. Never calculate or infer these times yourself.
-11. Present the exact script output using short ADHD-friendly wording:
+10. Never calculate, convert, or infer these times yourself. Reword the field values for tone; never change or recompute them.
+11. On success, present the exact field values using short ADHD-friendly wording:
 
     - ⏳ Wrap up
     - 🎒 Get ready
@@ -40,8 +50,8 @@ When the user asks when they should leave, or about their next meeting or depart
     - 🚕 Taxi
 
 12. Prefer concrete actions over abstract time-only language.
-13. If the script fails, say that the planner could not be run. Do not guess.
-14. If the script reports that the event has no location set, ask the user for the destination. Do not guess or invent one, and do not run the planner again until a destination is available.
+13. If the command produces no valid JSON at all (crash, empty output), say that the planner could not be run. Do not guess.
+14. If the JSON output contains an "error" field, relay its "message" value to the user exactly (do not guess or invent a location, destination, or time), and do not run the planner again until the user has resolved the underlying issue (a missing event, a missing destination, or an unconfirmed location).
 
 Example:
 
