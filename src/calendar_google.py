@@ -91,6 +91,7 @@ def get_next_event():
                 "Untitled event",
             ),
             "start": start,
+            "end": event.get("end", {}).get("dateTime"),
             "location": event.get("location"),
             "attendees": attendees,
         }

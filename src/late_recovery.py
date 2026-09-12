@@ -23,6 +23,7 @@ def build_result(event: dict, meeting_time: datetime, options: list) -> dict:
         "event": event["title"],
         "destination": event["location"],
         "meeting_time": format_24h(meeting_time),
+        "attendees": event.get("attendees", []),
         "options": [
             {
                 "mode": mode,

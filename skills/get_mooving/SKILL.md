@@ -35,11 +35,14 @@ When the user asks when they should leave, or about their next meeting or depart
    - event title
    - destination
    - meeting time
+   - event end time (`event_end`, `null` if the calendar event has none)
    - wrap-up time
    - get-ready time
    - leave-prompt time
    - physical departure time
    - arrival time
+
+   `event_end` means you never need to ask "what time does it end?" — it's already in this JSON. See "Trip Chaining" below for using it.
 8. Never use example values from this file.
 9. Never reuse times from an earlier conversation.
 10. Never calculate, convert, or infer these times yourself. Reword the field values for tone; never change or recompute them.
@@ -113,7 +116,7 @@ When the user signals they are behind — "late", "just finished shower", "still
 
 2. It prints one JSON object on success, with one entry per transport mode:
 
-   {"event": ..., "destination": ..., "meeting_time": ..., "options": [{"mode": "public_transport", "expected_arrival": ..., "lateness_minutes": ...}, {"mode": "drive", "expected_arrival": ..., "lateness_minutes": ...}]}
+   {"event": ..., "destination": ..., "meeting_time": ..., "attendees": [{"name": ..., "email": ...}, ...], "options": [{"mode": "public_transport", "expected_arrival": ..., "lateness_minutes": ...}, {"mode": "drive", "expected_arrival": ..., "lateness_minutes": ...}]}
 
    or an "error" field on failure, using the same reasons as the planner (`no_upcoming_event`, `no_destination`, `location_confirmation_required`, `destination_not_found`, `start_location_not_found`). Handle these exactly as documented above under "Destination Override" and "Location Confirmation", then re-run this script instead of the planner once resolved.
 3. Never calculate, convert, or infer any `expected_arrival` or `lateness_minutes` yourself — use the exact JSON values for every option.
@@ -125,8 +128,21 @@ When the user signals they are behind — "late", "just finished shower", "still
 
    Then choose how to communicate the recommendation yourself — this is a wording decision, not a calculation. Recommend whichever option has the lowest (or no) lateness, in your own words, e.g. "Taxi gives you the best chance of being on time." If every option is late, say so plainly and recommend the least-late one rather than picking an arbitrary one.
    If an option's `lateness_minutes` is zero or negative, describe it as on time rather than inventing a late message for it.
-5. Offer to draft a short message to the attendee, using the event's attendee list. Never send it without explicit user approval.
-6. Support approve / edit / cancel on that draft.
+5. If `attendees` is non-empty, offer to draft a short message to them, using the recommended option's `expected_arrival` and `lateness_minutes`. If `attendees` is empty, there is nobody to message — don't offer. For example:
+
+   💬 You're likely to arrive around <expected_arrival>. <attendee name> is listed on the appointment.
+
+   "Hi <name>, I'm on my way but I expect to arrive around <expected_arrival>, about <lateness_minutes> minutes late. Sorry about that."
+
+6. Present the draft for approval before anything else happens:
+
+   1. Looks good
+   2. Edit
+   3. Cancel
+
+   On "Edit," incorporate their feedback and show the revised draft for approval again — don't send an edited draft without a fresh approval. On "Cancel," drop it, no further action.
+7. Once approved, ask how they want it delivered: "Want me to send this, or will you forward it yourself?" There is currently no connected email or messaging tool that can actually send on the user's behalf — if they ask you to send it, say so plainly (don't claim to have sent something you didn't) and give them the approved text to copy and send themselves.
+8. Never send a message without explicit approval of its exact final content. Approval of the plan (step 4) is not approval of the message (step 6) — they are separate confirmations.
 
 # Hypothetical Departure or Mode
 
@@ -147,12 +163,54 @@ When the user asks a "what if" question about a specific departure time or trans
 
    {"departure": ..., "meeting_time": ..., "arrival_target": ..., "distance_km": ..., "weather": {"area": ..., "forecast": ..., "rain": ...} | null, "options": {"<mode>": {"travel_minutes": ..., "arrival": ...}, ...}, "best_option": "<mode>"}
 
-   (`best_option` only appears when more than one mode was checked. `weather` is `null` if the forecast lookup failed — don't treat that as an error, just don't mention weather.) Or an "error" field on failure, using the same reasons as the other scripts — handle exactly as documented above.
+   (`best_option` only appears when more than one mode was checked. `weather` is `null` if the forecast lookup failed — don't treat that as an error, just don't mention weather. `meeting_time`/`arrival_target` are absent entirely when `--destination` was overridden — see "Trip Chaining" below — since there's no meeting to frame the trip against.) Or an "error" field on failure, using the same reasons as the other scripts — handle exactly as documented above.
 4. Never calculate, convert, or infer `travel_minutes`, `arrival`, `distance_km`, or the weather fields yourself — use the exact JSON values.
 5. Always describe a `drive` result as a road-time estimate — it does not include how long a taxi takes to get hailed or arrive.
 6. `--compare` already excludes `walk`/`cycle` when they're too far or when `weather.rain` is true — you don't need to filter them yourself, and you don't need to re-explain why they're absent. If the user explicitly names walk or cycle with `--mode` despite rain or distance, the script still computes it (that's an explicit request, not a suggestion) — mention the rain or the distance so they can judge for themselves, rather than silently going along with it.
 7. This is a one-off check for that specific departure/mode. It does not change the plan from the main workflow, and nothing is saved anywhere.
 8. This script can only compute from a real departure time and a mode it has a function for. It cannot check "in an hour from now" without a concrete clock time, and it cannot check a mode with no function behind it. If asked something outside that, say so plainly rather than guessing.
+
+# Trip Chaining (Alternate Origins and Destinations)
+
+The default assumption everywhere above is: origin = confirmed current location, destination = the next calendar event. That assumption breaks the moment the user asks about a *different* leg of their day — "after class, I want to walk to lunch", "what if I go there straight from the office instead". `route_compare.py` accepts overrides for exactly this:
+
+   --origin "<address or place>"      # instead of the confirmed current location
+   --destination "<address or place>" # instead of the next calendar event's location
+
+Resolve which one to use with this priority, in order, and stop at the first that applies:
+
+1. **The user named a real place this turn.** Use it directly as `--origin`/`--destination`. Never invent one.
+2. **The user referenced a calendar event** ("after class", "from the office", "before my next meeting"). Read the relevant event's `location` and, for the departure time, its `end` (via `run_planner.sh --json`'s `event_end`, or a calendar lookup if the referenced event is not the very next one). Use the event's location as `--origin` and its end time as `--departure`. Do not ask the user for a time or place the calendar already answers — that is the exact mistake this section exists to prevent.
+3. **Neither of the above.** Fall back to the normal default: confirmed current location (still subject to the freshness check in "Location Confirmation") and/or the next calendar event.
+4. **Still ambiguous** (e.g. two events plausibly match "class", or the calendar has no matching event). Ask the user directly rather than guessing.
+
+When both `--origin` and `--destination` are overridden, the result has no `meeting_time`/`arrival_target`/lateness framing — it's a plain point-to-point trip. Present it as one: travel time and arrival per mode, not "you'll be late for X."
+
+This only affects that one call. It does not change any stored file, and does not change what the next default "when should I leave" query uses.
+
+# Ambiguous Place Names
+
+A destination like "McDonald's", "a pharmacy", or "the mall" is a category or brand, not a precise place — routing straight to the first geocoding match is dangerous, not just imprecise. (A real test of this: OneMap's own address search resolved "macdonal" to "MACDONALD HOUSE", an office building on Orchard Road with no relation to lunch. Treat every brand/category name as ambiguous until resolved, never geocode it directly with `search_location`/`route_compare.py --destination` yourself.)
+
+1. Determine the reference point for "near" — usually the resolved origin from "Trip Chaining" above (e.g. the class location), or the confirmed current location if there's no other context.
+2. Run:
+
+   /home/ming/42/openclaw/get_mooving/.venv/bin/python3 /home/ming/42/openclaw/get_mooving/src/place_resolver.py --query "<what the user said>" --near "<reference point>" --json
+
+3. It prints one JSON object on success:
+
+   {"query": ..., "near": ..., "candidates": [{"name": ..., "address": ..., "distance_km": ...}, ...]}
+
+   or an "error" field (`near_not_found`, `place_not_found`) — relay the `message` and ask for a more specific place.
+4. This search only covers what OneMap has indexed by name — it is not a complete business directory. Small retail/mall units are sometimes missing entirely, and the "nearest" result can be several kilometres away even in a dense area. Always state the actual `distance_km` rather than assuming "nearby" — let the user judge and correct you if they know a closer one this search missed.
+5. If there is exactly one clearly-nearest candidate, you may proceed with it, but say which one you picked. If there are several plausible candidates, list 2-3 with their distances and ask which one, e.g.:
+
+   🍟 Nearest matches I can find:
+   - <name> (<distance_km> km)
+   - <name> (<distance_km> km)
+
+   Which one?
+6. Once confirmed, use that candidate's `address` as `--destination` for `route_compare.py`.
 
 # Rules
 
@@ -162,5 +220,7 @@ When the user asks a "what if" question about a specific departure time or trans
 - Never silently use stale location information.
 - Never override planner.py calculations.
 - Never edit data/profile.json directly; only update_location.py may change it.
+- Never ask the user for information a script already gave you this turn (e.g. a calendar event's end time) — check what you already have before asking.
+- Never treat a brand/category name (a chain, "a pharmacy", "the mall") as a precise destination — resolve it with place_resolver.py first.
 - Do not shame or scold the user.
 - When plans change, focus on the next useful action.

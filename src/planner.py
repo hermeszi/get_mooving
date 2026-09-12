@@ -71,6 +71,10 @@ def build_result(event: dict, plan: dict, transport: str) -> dict:
         "event": event["title"],
         "destination": event["location"],
         "meeting_time": format_24h(plan["meeting_time"]),
+        "event_end": (
+            format_24h(datetime.fromisoformat(event["end"]))
+            if event.get("end") else None
+        ),
         "arrival_target": format_24h(plan["arrival_target"]),
         "wrap_up": format_24h(plan["wrap_up_prompt"]),
         "get_ready": format_24h(plan["get_ready_prompt"]),

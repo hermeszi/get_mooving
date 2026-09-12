@@ -79,6 +79,69 @@ def search_location(query: str) -> dict:
 
     raise ValueError(f"Location not found: {query}")
 
+
+def search_places(query: str, near: dict, limit: int = 3) -> list:
+    """
+    Find named places/branches matching a brand or place name (e.g.
+    "McDonald's"), sorted by straight-line distance to `near`.
+
+    Unlike search_location(), this returns multiple candidates instead
+    of assuming the first result is correct — a fuzzy brand name can
+    match several real branches, or an unrelated building with a
+    similar name.
+    """
+
+    results = []
+    page = 1
+    total_pages = 1
+
+    while page <= total_pages:
+        params = {
+            "searchVal": query,
+            "returnGeom": "Y",
+            "getAddrDetails": "Y",
+            "pageNum": page,
+        }
+
+        response = requests.get(
+            SEARCH_URL,
+            headers=get_headers(),
+            params=params,
+            timeout=10,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if data.get("error"):
+            raise RuntimeError(data["error"])
+
+        results.extend(data.get("results", []))
+        total_pages = data.get("totalNumPages", 1)
+        page += 1
+
+    if not results:
+        raise ValueError(f"Location not found: {query}")
+
+    candidates = [
+        {
+            "name": result.get("SEARCHVAL") or result["ADDRESS"],
+            "address": result["ADDRESS"],
+            "postal": result.get("POSTAL"),
+            "latitude": float(result["LATITUDE"]),
+            "longitude": float(result["LONGITUDE"]),
+        }
+        for result in results
+    ]
+
+    candidates.sort(key=lambda candidate: straight_line_km(near, candidate))
+
+    for candidate in candidates:
+        candidate["distance_km"] = round(straight_line_km(near, candidate), 2)
+
+    return candidates[:limit]
+
 # def search_location(query: str) -> dict:
 #     """
 #     Convert an address/building name/postal code into coordinates.

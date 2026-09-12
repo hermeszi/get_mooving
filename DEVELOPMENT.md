@@ -1086,16 +1086,20 @@ There is currently no way to feed a user-supplied destination back into `planner
 - [x] closed a real unchecked-comparative-claim hallucination caught in live testing (§36, new Rules entry)
 - [x] walk/cycle modes, distance-gated (§38, `onemap.get_walk_time`/`get_cycle_time`)
 - [x] weather-aware filtering — NEA 2-hour forecast (§38, `weather.py`)
+- [x] calendar event end times (§39, `calendar_google.py`/`planner.py`)
+- [x] trip chaining — alternate origin/destination overrides (§39, `route_compare.py --origin`/`--destination`)
+- [x] ambiguous place-name resolution — brand/category → nearest real candidates (§39, `place_resolver.py`)
+- [x] late-message drafting + approval flow (§40, `SKILL.md`) — sending itself still open, see below
 
 ### Still being developed
 
 - [ ] proactive scheduled prompts
-- [ ] Gmail late-message drafting + approval
 - [ ] Docker / cloud deployment
 
-### Optional, blocked on external access (§37)
+### Optional, blocked on external access
 
-- [ ] Grab Farefeed integration — real pickup ETA, fare range, surge level, deep link. Needs Grab partner API credentials, which this repo does not have.
+- [ ] Grab Farefeed integration (§37) — real pickup ETA, fare range, surge level, deep link. Needs Grab partner API credentials, which this repo does not have.
+- [ ] Actually sending the drafted late message (§40) — needs `gog` (Google Workspace CLI) installed and configured, or another messaging integration. Confirmed via `openclaw skills info gog`: not installed, not configured.
 
 ---
 
@@ -1879,7 +1883,162 @@ Cycle appeared, walk correctly didn't, and the weather line was a real fact from
 
 ---
 
-## 39. Development Principles Learned
+## 39. Trip Chaining and Place Resolution
+
+A live test — "after class, I want to walk to lunch" → "macdonal" → "1pm" — exposed two gaps at once, deeper than another API integration:
+
+```text
+$ openclaw agent --agent main --message "after class, i want to walk to lunch"
+...Where are you thinking of having lunch?...
+
+$ openclaw agent --agent main --message "macdonal"
+...What time does class end?...
+
+$ openclaw agent --agent main --message "1pm"
+...that walk is 145 min to arrive 15:25 — but that looks like it's routing
+from home, not from Havelock Rd after class... 9.1 km is the same distance
+as your morning commute. The planner doesn't know your starting point will
+be Havelock Rd at 1pm... Which McDonald's were you thinking?
+```
+
+One thing worked correctly here: the agent noticed the 9.1 km / 145 min number looked wrong for a "walk to lunch" and refused to present it as fact — the `--compare` anti-hallucination rule from §36 generalizing exactly as hoped. But two real assumptions baked into every script so far broke:
+
+```text
+origin = confirmed current location  (always)
+destination = the next calendar event  (always)
+```
+
+Neither holds for "after class, walk to lunch" — origin should be the class's location, at the class's end time, and destination is a fuzzy brand name, not an address.
+
+### Gap 1: Calendar events had no end time
+
+`calendar_google.get_next_event()` only ever read `event.get("start")`. Google's Calendar API already returns an `end.dateTime` on the same event object — trivial to add:
+
+```python
+"end": event.get("end", {}).get("dateTime"),
+```
+
+Also threaded into `planner.py`'s JSON output as `event_end`, so an agent that already ran the normal "when should I leave" flow has the class's end time on hand without a second call. Verified live: `Coding class` actually ends at `17:30` (real data — later than the illustrative "1pm" in the test transcript, which was invented by the model in that turn, not read from anywhere real).
+
+### Gap 2: origin/destination were hardcoded assumptions, not inputs
+
+Proposed as a new `origin_resolver.py` module that would decide, in Python, whether the user "referenced" a calendar event. Pushed back on that specific piece: that decision — does "after class" refer to a calendar event, and which one — is a language-understanding judgment call, the same category of thing this log has kept out of Python everywhere else (skill dispatch in §29, destination extraction in §33, mode extraction in §36). Built instead as two optional overrides on `route_compare.py`:
+
+```text
+--origin "<address or place>"       # instead of confirmed current location
+--destination "<address or place>"  # instead of the next calendar event's location
+```
+
+Same "explicit request bypasses automatic default" shape as `--destination` on `planner.py` (§33). When *both* are overridden, the result carries no `meeting_time`/`arrival_target`/lateness framing at all — it's a plain point-to-point trip, not "will I be late for X." The origin/destination *resolution hierarchy* (explicit place the user named → a referenced calendar event's location + end time → confirmed current location → ask) lives in `SKILL.md`, as a new "Trip Chaining" section — the agent decides which case applies and fills in the flags; the script only ever executes a fully-specified request.
+
+### Gap 3 (found while building the fix, not in the original ask): brand names can silently resolve to the wrong real place
+
+Tested `search_location("macdonal")` — the user's actual typo — against the live OneMap API. It returned **"MACDONALD HOUSE"**, a real office building on Orchard Road, with full confidence and no error. Not a "not found" — a wrong, plausible-looking, silently-accepted answer. Confirms the risk called out when this was proposed: routing straight to the first geocoding match for a brand/category name is unsafe, not just imprecise.
+
+Also tested whether OneMap could serve as a POI search at all before committing to a design — it can: 16 real "McDonald's"-named entries came back for a broader query, each with real coordinates. No new Places API/credentials needed, unlike Grab (§37). One correction made during testing: fetching only page 1 of results missed the actual nearest branch (a real nearby one was on page 2) — `onemap.search_places()` now paginates through every page OneMap reports before sorting by distance.
+
+A genuine, honest limitation surfaced by this same testing: OneMap's index has real gaps for small retail/mall-unit outlets. The nearest OneMap-indexed McDonald's to Havelock Rd is **4.1 km away** (Gardens by the Bay) — not the "short walk to Clarke Quay" casually assumed in the original test conversation. `SKILL.md` now requires stating the actual distance rather than asserting "nearby," specifically because this data source is known-incomplete.
+
+**Root cause, noted explicitly:** OneMap is a Singapore government dataset, updated on its own release cycle. It has no equivalent of Google Maps' crowdsourced updates — new outlets, closures, and renamed businesses don't appear until OneMap's own data is refreshed, however long that takes. This isn't a bug to fix; it's a structural property of the data source, and the reason §39's "state the real distance, never assert completeness" rule exists. Any future feature built on OneMap (routing, geocoding, or `search_places`) inherits this same staleness risk, not just place lookup.
+
+```python
+def search_places(query: str, near: dict, limit: int = 3) -> list:
+    # ...fetch every page OneMap reports...
+    candidates.sort(key=lambda c: straight_line_km(near, c))
+    return candidates[:limit]
+```
+
+New `src/place_resolver.py` wraps this as its own script (`--query`, `--near`, `--json`), returning `{"query", "near", "candidates": [{"name", "address", "distance_km"}, ...]}` — the agent presents the nearest 2-3 and asks, or proceeds with a clearly-nearest single match while still naming it.
+
+### `SKILL.md`: two new sections
+
+**"Trip Chaining"** — the origin/destination resolution hierarchy, with an explicit instruction not to ask for anything the calendar already answered (the exact "what time does class end?" mistake). **"Ambiguous Place Names"** — never treat a brand/category as a precise destination; resolve through `place_resolver.py` first, state the real distance, ask when genuinely ambiguous. Two matching Rules entries added.
+
+### Verified live: the exact original scenario, fixed
+
+```text
+$ openclaw agent --agent main --message "after class, i want to walk to lunch"
+Your class (Coding class) wraps up at 17:30 at 22 Havelock Rd.
+Where do you want to walk to for lunch? (I'll find the nearest match.)
+
+$ openclaw agent --agent main --message "macdonal"
+🍟 Nearest McDonald's I found: Gardens by the Bay (4.1 km away)
+🚶 Leave class at 17:30 → arrive ~18:33 (about 63 min walk)
+🌤️ Weather: Partly cloudy, no rain...
+Worth noting: that's quite a trek. There might be a closer McDonald's that
+OneMap doesn't have indexed. Do you want to go with this one, or a
+different lunch spot closer to Havelock Rd?
+```
+
+No "what time does class end?" this time — it already knew. The typo was corrected to "mcdonald" before querying (confirmed by cross-checking both spellings directly: `"macdonal"` still returns the wrong Macdonald House, `"mcdonald"` returns Gardens by the Bay at exactly `4.13 km`, matching the agent's `4.1 km` and the `63 min` / `18:33` walk result exactly). The wrong-building failure mode is gone, the missing-end-time question is gone, and the honest "OneMap might be missing a closer one" caveat appeared unprompted, exactly as instructed.
+
+---
+
+## 40. Late-Message Drafting
+
+The last piece explicitly named in `Get_Mooving.md`'s original Day-2 plan: when late, draft a short message to the attendee and require human approval before anything is sent.
+
+```text
+Calendar          OneMap           late_recovery.py        Claude
+  ├ appointment      └ ETA            └ lateness_min          └ drafts
+  ├ attendee                                                    contextual
+  └ email                                                       message
+```
+
+All the raw facts already existed by §34 — `late_recovery.py` computed `expected_arrival`/`lateness_minutes`, and `calendar_google.get_next_event()` already returned `attendees` (`{"name", "email"}`). The only missing wire: `late_recovery.py`'s own JSON output dropped `attendees` on the way out. One-line fix:
+
+```python
+"attendees": event.get("attendees", []),
+```
+
+Everything past that point — drafting the wording, asking for approval, handling an edit — is exactly the kind of thing this log has kept out of Python throughout: language generation and judgment calls belong to the model, not the script. `SKILL.md`'s "Late Recovery" section gained the concrete flow:
+
+1. If `attendees` is empty, there's nobody to message — don't offer.
+2. Draft using the recommended option's real `expected_arrival`/`lateness_minutes` — never invented numbers.
+3. Present for approval: **1. Looks good / 2. Edit / 3. Cancel.** An edit produces a new draft that needs its own fresh approval — approving the edit request is not approving the edited text.
+4. Only after approval, ask how to deliver it.
+
+### Honesty check before building the "send" half
+
+`Get_Mooving.md`'s own scope table lists Gmail integration as "Draft first; wait for approval" and Current Status (§27) has always carried "Gmail late-message drafting + approval" as not built. Checked directly before assuming otherwise: `openclaw skills info gog` (the bundled Google Workspace CLI skill) — `Needs setup`, binary not installed, not visible to the model, not available as a command. There is no configured way for this agent to actually send an email or message right now.
+
+Rather than build a "Send for me" option against a capability that doesn't exist — which would either silently fail or, worse, let the model claim to have sent something it didn't — the flow asks the delivery question honestly:
+
+```text
+"Want me to send this, or will you forward it yourself?"
+```
+
+and, if the user asks it to send: say plainly that no messaging tool is connected, and hand over the approved text to copy. This is the same discipline as every fail-closed decision in this log (§26 crashing cleanly instead of guessing, §37 logging Grab as blocked rather than guessing its API shape) applied to a new case: don't claim an action happened that didn't.
+
+### Verified live
+
+Real event has no attendees, so `calendar_google.get_next_event()` was temporarily forced to a meeting with Sarah as an attendee (reverted after, confirmed via `git diff` — only the legitimate `end` field from §39 remained):
+
+```text
+$ openclaw agent --agent main --message "I'm running late for my meeting"
+🚨 Plans changed — Coffee with Sarah at SUTD...
+🚕 Drive/taxi — arrive 01:49 (10 min late)
+💬 Sarah is listed on the appointment. Want me to draft a quick message?
+"Hi Sarah, I'm on my way but running a bit behind — should arrive around
+1:49, about 10 minutes late. Sorry about that!"
+1. Looks good  2. Edit  3. Cancel
+
+$ openclaw agent --agent main --message "1"
+Got it! Here's the approved message: "..."
+Want me to send this, or will you forward it yourself? (Heads up: I don't
+have a connected messaging tool right now, so I can't send it directly —
+but you can copy and paste it straight to Sarah.)
+```
+
+No false claim of sending. Also tested the edit path on a separate run — "2, make it more casual and mention I'm stuck in traffic" produced a revised draft ("Hey Sarah! Stuck in traffic rn...") and asked for approval again rather than treating the edit request itself as approval.
+
+### Still open
+
+Actually sending anything — Gmail, WhatsApp, or otherwise — stays unbuilt, now for a confirmed reason (`gog` needs installing and configuring) rather than an assumed one. Day-2's drafting half is done; the send half is exactly where `Get_Mooving.md` always said it would wait: on a real, tested integration, not a guess.
+
+---
+
+## 41. Development Principles Learned
 
 ### Test one layer at a time
 
@@ -1940,7 +2099,7 @@ Gmail unavailable
 
 ---
 
-## 40. Approximate Repo Structure
+## 42. Approximate Repo Structure
 
 ```text
 get_mooving/
@@ -1963,7 +2122,8 @@ get_mooving/
 │   ├── update_location.py
 │   ├── late_recovery.py
 │   ├── route_compare.py
-│   └── weather.py
+│   ├── weather.py
+│   └── place_resolver.py
 │
 ├── skills/
 │   └── get_mooving/
@@ -1977,7 +2137,7 @@ get_mooving/
 
 ---
 
-## 41. Short Development Summary
+## 43. Short Development Summary
 
 The prototype grew in this order:
 

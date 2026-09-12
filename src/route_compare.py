@@ -46,8 +46,6 @@ def build_result(
 ) -> dict:
     result = {
         "departure": format_24h(departure_time),
-        "meeting_time": format_24h(meeting_time),
-        "arrival_target": format_24h(arrival_target),
         "distance_km": round(distance_km, 1),
         "weather": weather,
         "options": {
@@ -59,6 +57,12 @@ def build_result(
         },
     }
 
+    if meeting_time is not None:
+        result["meeting_time"] = format_24h(meeting_time)
+
+    if arrival_target is not None:
+        result["arrival_target"] = format_24h(arrival_target)
+
     if len(options) > 1:
         result["best_option"] = min(
             options, key=lambda mode: options[mode][1]
@@ -69,10 +73,18 @@ def build_result(
 
 def print_result(result: dict) -> None:
     print()
-    print(
-        f"Departure {result['departure']} -> meeting {result['meeting_time']} "
-        f"(arrival target {result['arrival_target']}, {result['distance_km']} km)"
-    )
+
+    header = f"Departure {result['departure']}"
+
+    if "meeting_time" in result:
+        header += f" -> meeting {result['meeting_time']}"
+
+    if "arrival_target" in result:
+        header += f" (arrival target {result['arrival_target']}, {result['distance_km']} km)"
+    else:
+        header += f" ({result['distance_km']} km)"
+
+    print(header)
 
     if result["weather"]:
         print(f"Weather ({result['weather']['area']}): {result['weather']['forecast']}")
@@ -94,6 +106,14 @@ def main():
         "--departure",
         required=True,
         help='Hypothetical departure time, 24-hour "HH:MM".',
+    )
+    parser.add_argument(
+        "--origin",
+        help="Override the starting point (address or place). Default: confirmed current location.",
+    )
+    parser.add_argument(
+        "--destination",
+        help="Override the destination (address or place) instead of the next calendar event's location.",
     )
     mode_group = parser.add_mutually_exclusive_group(required=True)
     mode_group.add_argument(
@@ -128,51 +148,71 @@ def main():
         )
         return
 
-    event = get_next_event()
     profile = load_json("profile.json")
 
-    if not event:
-        emit_error("no_upcoming_event", "No upcoming timed events found.")
-        return
+    if args.origin:
+        try:
+            start_location = search_location(args.origin)
+        except ValueError as error:
+            emit_error("start_location_not_found", str(error))
+            return
+    else:
+        location = profile["location"]
 
-    if not event.get("location"):
-        emit_error(
-            "no_destination",
-            f"'{event['title']}' has no location set. "
-            "Cannot calculate travel time without a destination.",
-            event=event["title"],
+        if not is_location_fresh(location.get("confirmed_at"), datetime.now().astimezone()):
+            emit_error(
+                "location_confirmation_required",
+                location_confirmation_prompt(location["label"]),
+                label=location["label"],
+            )
+            return
+
+        try:
+            start_location = search_location(location["address"])
+        except ValueError as error:
+            emit_error("start_location_not_found", str(error))
+            return
+
+    meeting_time = None
+    arrival_target = None
+
+    if args.destination:
+        try:
+            destination = search_location(args.destination)
+        except ValueError as error:
+            emit_error("destination_not_found", str(error))
+            return
+    else:
+        event = get_next_event()
+
+        if not event:
+            emit_error("no_upcoming_event", "No upcoming timed events found.")
+            return
+
+        if not event.get("location"):
+            emit_error(
+                "no_destination",
+                f"'{event['title']}' has no location set. "
+                "Cannot calculate travel time without a destination.",
+                event=event["title"],
+            )
+            return
+
+        meeting_time = datetime.fromisoformat(event["start"])
+        arrival_target = meeting_time - timedelta(
+            minutes=profile["buffers"]["early_arrival_minutes"]
         )
-        return
 
-    location = profile["location"]
+        try:
+            destination = search_location(event["location"])
+        except ValueError as error:
+            emit_error("destination_not_found", str(error))
+            return
 
-    if not is_location_fresh(location.get("confirmed_at"), datetime.now().astimezone()):
-        emit_error(
-            "location_confirmation_required",
-            location_confirmation_prompt(location["label"]),
-            label=location["label"],
-        )
-        return
-
-    meeting_time = datetime.fromisoformat(event["start"])
-    departure_time = datetime.combine(
-        meeting_time.date(), departure_clock, tzinfo=meeting_time.tzinfo
-    )
-    arrival_target = meeting_time - timedelta(
-        minutes=profile["buffers"]["early_arrival_minutes"]
-    )
-
-    try:
-        start_location = search_location(location["address"])
-    except ValueError as error:
-        emit_error("start_location_not_found", str(error))
-        return
-
-    try:
-        destination = search_location(event["location"])
-    except ValueError as error:
-        emit_error("destination_not_found", str(error))
-        return
+    now_local = datetime.now().astimezone()
+    anchor_date = meeting_time.date() if meeting_time else now_local.date()
+    anchor_tz = meeting_time.tzinfo if meeting_time else now_local.tzinfo
+    departure_time = datetime.combine(anchor_date, departure_clock, tzinfo=anchor_tz)
 
     distance_km = straight_line_km(start_location, destination)
 
