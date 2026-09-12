@@ -108,6 +108,10 @@ def main():
         action="store_true",
         help="Print the plan (or any failure) as JSON instead of text.",
     )
+    parser.add_argument(
+        "--destination",
+        help="Destination to use when the calendar event has no location.",
+    )
     args = parser.parse_args()
 
     def emit_error(reason: str, message: str, **extra) -> None:
@@ -124,13 +128,16 @@ def main():
         return
 
     if not event.get("location"):
-        emit_error(
-            "no_destination",
-            f"'{event['title']}' has no location set. "
-            "Cannot calculate travel time without a destination.",
-            event=event["title"],
-        )
-        return
+        if args.destination:
+            event["location"] = args.destination
+        else:
+            emit_error(
+                "no_destination",
+                f"'{event['title']}' has no location set. "
+                "Cannot calculate travel time without a destination.",
+                event=event["title"],
+            )
+            return
 
     location = profile["location"]
 
@@ -146,10 +153,17 @@ def main():
 
     buffers = profile["buffers"]
 
-    start_location = search_location(location["address"])
+    try:
+        start_location = search_location(location["address"])
+    except ValueError as error:
+        emit_error("start_location_not_found", str(error))
+        return
 
-    destination = search_location(
-        event["location"])
+    try:
+        destination = search_location(event["location"])
+    except ValueError as error:
+        emit_error("destination_not_found", str(error))
+        return
 
     #do one rough estimate
     rough_departure = meeting_time - timedelta(

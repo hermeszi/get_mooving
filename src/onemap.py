@@ -119,6 +119,48 @@ def search_location(query: str) -> dict:
 #     }
 
 
+def _request_route(params: dict) -> dict:
+    response = requests.get(
+        ROUTE_URL,
+        headers=get_headers(),
+        params=params,
+        timeout=15,
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+def _extract_minutes(data: dict) -> int:
+    # OneMap PT responses normally contain itineraries.
+    itineraries = data.get("plan", {}).get("itineraries", [])
+
+    if itineraries:
+        seconds = itineraries[0]["duration"]
+        return math.ceil(seconds / 60)
+
+    # walk/drive/cycle responses use route_summary instead.
+    route_summary = data.get("route_summary")
+
+    if route_summary and "total_time" in route_summary:
+        return math.ceil(route_summary["total_time"] / 60)
+
+    raise RuntimeError(
+        f"Could not find journey duration in OneMap response: {data}"
+    )
+
+
+def _start_end_params(start: dict, destination: dict) -> dict:
+    return {
+        "start": f"{start['latitude']},{start['longitude']}",
+        "end": (
+            f"{destination['latitude']},"
+            f"{destination['longitude']}"
+        ),
+    }
+
+
 def get_public_transport_time(
     start: dict,
     destination: dict,
@@ -129,11 +171,7 @@ def get_public_transport_time(
     """
 
     params = {
-        "start": f"{start['latitude']},{start['longitude']}",
-        "end": (
-            f"{destination['latitude']},"
-            f"{destination['longitude']}"
-        ),
+        **_start_end_params(start, destination),
         "routeType": "pt",
         "mode": "TRANSIT",
         "date": departure_time.strftime("%m-%d-%Y"),
@@ -142,33 +180,87 @@ def get_public_transport_time(
         "numItineraries": 1,
     }
 
-    response = requests.get(
-        ROUTE_URL,
-        headers=get_headers(),
-        params=params,
-        timeout=15,
+    return _extract_minutes(_request_route(params))
+
+
+def get_drive_time(
+    start: dict,
+    destination: dict,
+    departure_time: datetime,
+) -> int:
+    """
+    Return driving (car/taxi) journey time in minutes.
+    """
+
+    params = {
+        **_start_end_params(start, destination),
+        "routeType": "drive",
+        "date": departure_time.strftime("%m-%d-%Y"),
+        "time": departure_time.strftime("%H:%M:%S"),
+    }
+
+    return _extract_minutes(_request_route(params))
+
+
+def get_walk_time(
+    start: dict,
+    destination: dict,
+    departure_time: datetime,
+) -> int:
+    """
+    Return walking journey time in minutes.
+    """
+
+    params = {
+        **_start_end_params(start, destination),
+        "routeType": "walk",
+        "date": departure_time.strftime("%m-%d-%Y"),
+        "time": departure_time.strftime("%H:%M:%S"),
+    }
+
+    return _extract_minutes(_request_route(params))
+
+
+def get_cycle_time(
+    start: dict,
+    destination: dict,
+    departure_time: datetime,
+) -> int:
+    """
+    Return cycling journey time in minutes.
+    """
+
+    params = {
+        **_start_end_params(start, destination),
+        "routeType": "cycle",
+        "date": departure_time.strftime("%m-%d-%Y"),
+        "time": departure_time.strftime("%H:%M:%S"),
+    }
+
+    return _extract_minutes(_request_route(params))
+
+
+def straight_line_km(a: dict, b: dict) -> float:
+    """
+    Straight-line ("as the crow flies") distance in km between two
+    {latitude, longitude} points. Used to decide whether a route is
+    even worth asking about for walking/cycling, before making a
+    routing call.
+    """
+
+    lat1, lon1 = math.radians(a["latitude"]), math.radians(a["longitude"])
+    lat2, lon2 = math.radians(b["latitude"]), math.radians(b["longitude"])
+
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+
+    h = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
     )
 
-    response.raise_for_status()
-
-    data = response.json()
-
-    # OneMap PT responses normally contain itineraries.
-    itineraries = data.get("plan", {}).get("itineraries", [])
-
-    if itineraries:
-        seconds = itineraries[0]["duration"]
-        return math.ceil(seconds / 60)
-
-    # Useful fallback if the response uses route_summary.
-    route_summary = data.get("route_summary")
-
-    if route_summary and "total_time" in route_summary:
-        return math.ceil(route_summary["total_time"] / 60)
-
-    raise RuntimeError(
-        f"Could not find journey duration in OneMap response: {data}"
-    )
+    earth_radius_km = 6371
+    return 2 * earth_radius_km * math.asin(math.sqrt(h))
 
 
 if __name__ == "__main__":

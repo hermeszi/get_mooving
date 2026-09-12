@@ -1078,16 +1078,24 @@ There is currently no way to feed a user-supplied destination back into `planner
 - [x] normal prompt → planner execution without explicitly saying "use exec" (same fix)
 - [x] location freshness / confirmation (§30, `location_state.py`)
 - [x] structured planner output (§31, `planner.py --json`)
+- [x] location confirmation input loop closed (§32, `update_location.py`)
+- [x] destination override input loop closed (§33, `planner.py --destination`)
+- [x] `late` recovery — first version (§34, `late_recovery.py`)
+- [x] alternative transport comparison — MRT vs. taxi (§35, `onemap.get_drive_time`)
+- [x] hypothetical departure/mode queries — "what if I leave at X" (§36, `route_compare.py`)
+- [x] closed a real unchecked-comparative-claim hallucination caught in live testing (§36, new Rules entry)
+- [x] walk/cycle modes, distance-gated (§38, `onemap.get_walk_time`/`get_cycle_time`)
+- [x] weather-aware filtering — NEA 2-hour forecast (§38, `weather.py`)
 
 ### Still being developed
 
-- [ ] destination override input, so an answer to "where is it?" can reach `planner.py`
-- [ ] location confirmation input, so a 1/2/3 answer can reach `planner.py` (same shape as above; §31 recommends a small `update_location.py` script over letting the LLM edit JSON directly)
 - [ ] proactive scheduled prompts
-- [ ] `late` recovery
-- [ ] alternative transport comparison
 - [ ] Gmail late-message drafting + approval
 - [ ] Docker / cloud deployment
+
+### Optional, blocked on external access (§37)
+
+- [ ] Grab Farefeed integration — real pickup ETA, fare range, surge level, deep link. Needs Grab partner API credentials, which this repo does not have.
 
 ---
 
@@ -1431,7 +1439,447 @@ Recommendation reached: a small script, not direct LLM edits. The reasoning is t
 
 ---
 
-## 32. Development Principles Learned
+## 32. `update_location.py`
+
+§26 and §30/§31 all flagged the same unclosed gap: the agent could present the 📍 confirmation prompt, but there was no path for the user's answer to reach `profile.json` — it required manual editing. §31 recommended a small deterministic script over letting the LLM edit JSON directly, for the same reason a cheap model was already shown (§29) to be unreliable at far simpler mechanics. That script was built.
+
+```text
+src/
+├── calendar_google.py
+├── location_state.py
+├── onemap.py
+├── planner.py
+└── update_location.py      ← new
+```
+
+```text
+input
+  ↓
+validate location (OneMap, only for --address)
+  ↓
+update profile.json (atomic write: temp file + os.replace)
+  ↓
+set confirmed_at = now
+  ↓
+return JSON success
+```
+
+Two modes, covering the two answers that make sense against the current single-location profile schema:
+
+```bash
+# option 1 — "yes, still here": refresh the timestamp only
+.venv/bin/python src/update_location.py --confirm
+# {"status": "ok", "location": "Home", "confirmed_at": "2026-09-12T22:53:38.792461+08:00"}
+
+# option 3 — "somewhere else": validate + replace the stored location
+.venv/bin/python src/update_location.py --address "SUTD" --label "SUTD"
+# {"status": "ok", "location": "SUTD", "confirmed_at": "2026-09-12T22:53:44.118907+08:00"}
+```
+
+`--address` goes through `onemap.search_location` before anything is written, so a bad address fails closed instead of corrupting the profile:
+
+```json
+{"error": "location_not_found", "message": "Location not found: Nonexistent Fake Place Zzzz"}
+```
+
+Option 2 ("a named preset like Home") was deliberately not built as a separate case: `profile.json` only ever stores one location, and it's already labeled "Home" in the example data. Jumping back to "Home" as distinct from "confirm current" would need a second, permanently-stored home address independent of the current one — a real data-model change, not a stupid-simple MVP addition. Left alone until it's actually needed.
+
+### Wired into `SKILL.md`
+
+A new "Location Confirmation" section tells the agent: on option 1, exec `update_location.py --confirm`; on a named place, exec `update_location.py --address "..." --label "..."`; on that script's own `"error"` field, relay the message and do not mark anything confirmed; on `"status": "ok"`, re-run `run_planner.sh --json`. Two rules were added to the top-level Rules list: never edit `data/profile.json` directly, and only `update_location.py` may set `confirmed_at`. Reinstalled and gateway restarted as usual.
+
+### Verified live, full loop
+
+`data/profile.json`'s `confirmed_at` was set to an old date to force the prompt, on a fresh session:
+
+```text
+$ openclaw agent --agent main --message "Where is my next meeting?"
+📍 Still starting from Home?
+1. Yes  2. Home  3. Somewhere else
+
+$ openclaw agent --agent main --message "1"
+Coding class at 22 Havelock Rd 🏫
+⏳ Wrap up    09:39
+🎒 Get ready  09:49
+🚪 Leave      10:04
+🚇 Arrive     ~10:50
+```
+
+`data/profile.json` afterward had a genuinely fresh `confirmed_at` (`2026-09-12T22:55:01...`) — the agent actually ran `update_location.py --confirm`, not just narrated success. The full loop from the design diagram now works end to end:
+
+```text
+User: 1
+  ↓
+exec update_location.py --confirm
+  ↓
+profile timestamp updated
+  ↓
+exec run_planner.sh --json
+  ↓
+⏳ 🎒 🚪
+```
+
+---
+
+## 33. Destination Override
+
+§26's missing-destination fix only ever made `planner.py` fail cleanly; it never gave the agent a way to actually supply the destination the user names. That gap is now closed the same way §32 closed the location gap — a CLI flag, not a file edit.
+
+```text
+Calendar event has no location
+       ↓
+Agent asks destination
+       ↓
+User: "SUTD"
+       ↓
+run_planner --destination "SUTD"
+       ↓
+OneMap
+       ↓
+plan
+```
+
+### `planner.py --destination`
+
+```python
+if not event.get("location"):
+    if args.destination:
+        event["location"] = args.destination
+    else:
+        emit_error("no_destination", ...)
+        return
+```
+
+The override only ever applies for that one run — nothing is written back to `data/mock_calendar.json` or anywhere else. Next time the same event comes up, the agent asks again.
+
+### Fail closed on a bad address
+
+Adding a free-text `--destination` raises the odds of an address OneMap can't resolve (a typo, something too vague). Previously `search_location()` raising `ValueError` for *either* the start or destination address would crash `planner.py` with a raw traceback — a latent bug from before this flag existed, but one this flag makes much more likely to hit. Both calls are now wrapped:
+
+```python
+try:
+    destination = search_location(event["location"])
+except ValueError as error:
+    emit_error("destination_not_found", str(error))
+    return
+```
+
+(and the same for the start location → `start_location_not_found`.)
+
+### `SKILL.md`: new "Destination Override" section
+
+Mirrors "Location Confirmation": on `"error": "no_destination"`, ask the user directly, take their answer literally, re-run with `--destination "<answer>"`, and relay `destination_not_found` if OneMap still can't place it. Reinstalled and gateway restarted.
+
+### Verified live, full loop
+
+Real Google Calendar data can't be edited from here to produce a location-less event on demand, so `calendar_google.py`'s `get_next_event()` was temporarily forced to return `"location": None`, tested live, then reverted — confirmed byte-identical via `git diff` afterward.
+
+```text
+$ openclaw agent --agent main --message "Where is my next meeting?"
+Your next meeting is Coding class, but it has no location set. Where is it?
+
+$ openclaw agent --agent main --message "SUTD"
+Coding class at SUTD — meeting at 11:00, aim to arrive by 10:50.
+⏳ 09:16   🎒 09:26   🚪 09:41   🚇 09:49 → ~10:50
+```
+
+The agent genuinely called `run_planner.sh --json --destination "SUTD"` — a real OneMap-routed plan from Home to SUTD, not a narrated guess.
+
+### Same evening, both override paths now proven live
+
+Between §32 and this section, all three gaps flagged back in §26/§30/§31 are closed the same way: a small deterministic script or flag takes structured input, the LLM only extracts what the user said.
+
+| Missing info | Ask | Resolve |
+|---|---|---|
+| Destination | "Where is it?" | `run_planner.sh --json --destination "..."` |
+| Location confirmation | "Still starting from X?" | `update_location.py --confirm` |
+| Location change | (user names a new place) | `update_location.py --address "..." --label "..."` |
+
+---
+
+## 34. `late_recovery.py` — Day-2 Foundation
+
+The first Day-2 feature from `Get_Mooving.md`'s 3-day plan: recompute the plan from *right now* instead of the original scheduled departure, when the user signals they're behind.
+
+```text
+current time
+     +
+next event
+     +
+confirmed location
+     ↓
+OneMap public transport from NOW
+     ↓
+expected arrival
+     ↓
+meeting time
+     ↓
+lateness
+```
+
+Kept deliberately simple, and built by reusing existing pieces rather than duplicating them — `get_next_event`, `search_location`, `get_public_transport_time`, `is_location_fresh`, `location_confirmation_prompt` from their existing modules, plus `load_json`, `format_time`, and `format_24h` imported directly from `planner`. No new OneMap or calendar logic. The one thing genuinely new: since the departure time is already known (*now*), there's no need for `planner.py`'s two-pass rough-estimate/refine loop (§22) — a single OneMap query is enough.
+
+```python
+travel_minutes = get_public_transport_time(start_location, destination, now)
+expected_arrival = now + timedelta(minutes=travel_minutes)
+lateness_minutes = round((expected_arrival - meeting_time).total_seconds() / 60)
+```
+
+Same failure shapes as `planner.py` (`no_upcoming_event`, `no_destination`, `location_confirmation_required`, `destination_not_found`, `start_location_not_found`) — reuses the same `location_state` freshness check, so a stale location routes through the same `update_location.py` flow already built in §32 rather than a separate one.
+
+The "want to draft a message?" line was deliberately left out of the script's own output, in both text and JSON mode. That offer is a conversational judgment call, not a computed fact — it belongs in `SKILL.md`, matching every other decision in this log about where the model/script boundary sits.
+
+### `SKILL.md`: "Late Recovery" rewritten
+
+The old version was seven generic steps with no actual script behind them. Now: run `late_recovery.py --json`, treat its JSON as truth (never recompute `expected_arrival` or `lateness_minutes`), present it plainly, and only *then* offer to draft a message from the event's attendee list — never send without approval.
+
+### Verified live, both branches
+
+Real data first, unmodified: `Coding class` is many hours away, so a genuine "I'm running late for my meeting" produced a large negative `lateness_minutes` and the agent correctly reworded it as reassurance rather than alarm:
+
+```text
+$ openclaw agent --agent main --message "I'm running late for my meeting, what should I do?"
+🚨 Actually, you're good! Your Coding class doesn't start until 11:00 AM...
+If you left right now you'd arrive around 00:47 AM, which is over 10 hours early.
+```
+
+(`00:47` matches the direct `--json` test's `expected_arrival` exactly.)
+
+Plain "late" alone, with no urgency in context, was correctly read by the model as small talk about the hour — not a false trigger, a sensible read given nothing was actually at risk. Intent had to be unambiguous for the skill to fire, which is expected: the routing is based on the user meaning it, not the literal word.
+
+To see the genuinely-late branch, `calendar_google.get_next_event()` was temporarily overridden to return a meeting 15 minutes out at SUTD, tested live, then reverted (confirmed byte-identical via `git diff`):
+
+```text
+$ openclaw agent --agent main --message "I'm running late for my meeting"
+🚨 Plans changed.
+🚇 Leave now.
+Expected arrival: 01:11.
+You're likely to be about 66 minutes late to Standup at SUTD.
+
+Want me to draft a quick message to the attendees letting them know you're running late?
+```
+
+Matches the requested UX pattern exactly, and it stopped right there — no message was drafted or sent without being asked, per rule 6.
+
+### Not built yet
+
+- Comparing transport modes (MRT vs. taxi) — `Get_Mooving.md`'s Day 2 plan calls for this; `late_recovery.py` only checks public transport for now.
+- Actually drafting and sending the message (Gmail integration) — still just an offer at the agent level, per the existing Rules section.
+
+---
+
+## 35. Transport Comparison (🚕)
+
+§34 flagged "alternative transport comparison" as not built. Closed by extending `onemap.py` exactly as anticipated, plus wiring the result into `late_recovery.py`'s output shape.
+
+### `onemap.py`: `get_drive_time()`
+
+The existing `get_public_transport_time()` was refactored to share its HTTP call and response-parsing with a new sibling, rather than duplicating either:
+
+```python
+def _request_route(params): ...       # shared GET + raise_for_status + .json()
+def _extract_minutes(data): ...       # shared itineraries/route_summary parsing
+def _start_end_params(start, destination): ...  # shared start/end lat,lon
+
+def get_public_transport_time(start, destination, departure_time):
+    params = {**_start_end_params(...), "routeType": "pt", "mode": "TRANSIT", ...}
+    return _extract_minutes(_request_route(params))
+
+def get_drive_time(start, destination, departure_time):
+    params = {**_start_end_params(...), "routeType": "drive", "date": ..., "time": ...}
+    return _extract_minutes(_request_route(params))
+```
+
+`_extract_minutes`'s existing `route_summary.total_time` fallback (originally just "a useful fallback" for PT) turned out to already be the exact shape OneMap's `drive` routeType returns — no PT-only fields (`mode`, `maxWalkDistance`, `numItineraries`) needed. Verified live against the real OneMap API before wiring anything else: SUTD → postal 308232 came back as 63 min transit vs. 22 min drive, both plausible.
+
+### Walking / cycling: not added
+
+The question of whether to also add `get_walk_time()` / `get_cycle_time()` came up. Decision: no, for the *late-recovery* use case specifically. `Get_Mooving.md`'s original design table only ever names two recovery modes — 🚇 MRT and 🚕 Taxi — and real Singapore inter-neighbourhood distances (the kind that make someone late for a meeting) are usually tens of minutes to hours on foot or by bike, i.e. never actually competitive as a "how do I recover" option. `_request_route`/`_extract_minutes` make adding either mode a few-line change later if a real use case shows up (e.g. a "how should I go" planning feature, as opposed to lateness recovery) — just not built speculatively now.
+
+### `late_recovery.py`: multiple options instead of one
+
+The single `expected_arrival`/`lateness_minutes` fields from §34 became a list, one entry per mode:
+
+```json
+{"event": "...", "destination": "...", "meeting_time": "...",
+ "options": [
+   {"mode": "public_transport", "expected_arrival": "...", "lateness_minutes": ...},
+   {"mode": "drive", "expected_arrival": "...", "lateness_minutes": ...}
+ ]}
+```
+
+Text mode prints both lines; which one to recommend, and how, was deliberately left to `SKILL.md` / the model — that choice is a wording decision, not a calculation, matching every other script/model boundary call in this log.
+
+### `SKILL.md` updated
+
+"Late Recovery" step 4 now shows both lines and explicitly hands the recommendation to the model: "choose how to communicate the recommendation yourself... e.g. 'Taxi gives you the best chance of being on time.'" Reinstalled, gateway restarted.
+
+### Verified live
+
+Direct script tests first (real data: both modes came back hours early / on time; a synthetic 20-minutes-out meeting: transit 62 min late, drive 10 min late). Then live through the agent, with `calendar_google.get_next_event()` temporarily forced to a 20-minute-out meeting at SUTD (reverted after, confirmed via `git diff`):
+
+```text
+$ openclaw agent --agent main --message "I'm running late for my meeting"
+🚨 Plans changed — Standup at SUTD, meeting at 00:27.
+🚇 Public transport — arrive 03:42 (195 min late)
+🚕 Drive/taxi — arrive 00:37 (10 min late)
+Grab a taxi — it's your best shot, only 10 minutes late.
+Want me to draft a quick message to your standup attendees?
+```
+
+The first attempt at this test used `datetime.now(timezone.utc)` for the fake event instead of local time, which made the displayed `meeting_time` show as UTC (16:26) instead of SGT — confirmed as purely a flaw in the throwaway test fixture (the lateness numbers were still correct either way, since datetime subtraction is offset-independent) by rerunning with a locally-offset fake timestamp, which displayed correctly. Not a bug in any shipped file.
+
+---
+
+## 36. Hypothetical Departure / Mode — `route_compare.py`, and a Real Hallucination Caught
+
+Manual testing against the live agent (on `claude-sonnet-4.6`) surfaced a genuine gap, not a hypothetical one. Two consecutive test messages:
+
+```text
+$ openclaw agent --agent main --message "if I leave at 10:15 for next meeting, best way?"
+...The planner recommends 🚇 public transport, with a planned departure of 10:12.
+Leaving at 10:15 is 3 minutes past that... If you want a safer buffer,
+🚕 taxi would give you more flexibility at that point.
+
+$ openclaw agent --agent main --message "if I leave at 10:30 on taxi, can?"
+...The planner tools can only compute from right now — I can't simulate
+a hypothetical 10:30 departure without risking invented travel times,
+which I won't do... Best move: Around 10:25–10:30, ping me again with
+"running late" and I'll run the live late-recovery check.
+```
+
+Two very different outcomes from the same underlying cause: **there was no tool to answer "what if I leave at X" or "what if I take mode Y" at all.**
+
+- The second response handled the gap correctly — it noticed it had no way to check a hypothetical departure and said so instead of guessing. Exactly the behavior every other section of this log has been building toward.
+- The first response did not. "🚕 taxi would give you more flexibility" is plausible, and happened to be roughly true, but nothing had actually computed a taxi number that turn — `planner.py --json`'s output only ever contained the public-transport result. This is the same class of failure `SKILL.md` has been closing all along (§14: "the LLM started reinterpreting planner output and generated incorrect derived times"), just in a new shape: an *unchecked comparative claim* instead of a recalculated number.
+
+### `src/route_compare.py`
+
+Built to close the gap directly, reusing `get_public_transport_time` / `get_drive_time` (§35) and the same location-freshness/error-shape conventions as every other script:
+
+```bash
+python3 src/route_compare.py --departure "10:30" --mode drive --json
+# {"departure": "10:30", "meeting_time": "11:00", "arrival_target": "10:50",
+#  "options": {"drive": {"travel_minutes": 23, "arrival": "10:53"}}}
+
+python3 src/route_compare.py --departure "10:15" --compare --json
+# {"departure": "10:15", "meeting_time": "11:00", "arrival_target": "10:50",
+#  "options": {
+#    "drive": {"travel_minutes": 23, "arrival": "10:38"},
+#    "public_transport": {"travel_minutes": 38, "arrival": "10:53"}},
+#  "best_option": "drive"}
+```
+
+Real live numbers came back almost identical to the numbers used to originally describe this feature (38 min transit exactly, 23 vs. a sketched 24 min drive) — the design held up against the real API. `--mode` and `--compare` are a mutually exclusive argparse group; `best_option` (earliest arrival) only appears when more than one mode was checked. The departure time is combined with the *meeting's* date, not "today," so asking the night before about a tomorrow-morning meeting still resolves correctly. An unparsable `--departure` fails clean with `invalid_departure` rather than crashing.
+
+Per the user's own flagged worry — OneMap's `drive` time is road time only, it has no idea how long a taxi takes to be hailed or arrive — every `drive` label in both `route_compare.py` and `late_recovery.py` (§35) was updated to read "Drive/taxi (road estimate)", and `SKILL.md` now requires the agent to say so out loud.
+
+### `SKILL.md`: new "Hypothetical Departure or Mode" section, plus a new top-level rule
+
+The section wires natural-language "what if" questions to `route_compare.py`, extracting the departure time and mode (if named) from what the user actually said — never invented, never reused from earlier turns. It also states plainly what the script *can't* do (a relative time like "in an hour," a mode with no function behind it) so the agent says so instead of guessing, matching the second test response rather than the first.
+
+The actual fix for the hallucination itself is a new Rules entry, since the bug wasn't about missing capability — the agent already had a real `run_planner.sh --json` result in hand, it just editorialized past it:
+
+```text
+- Never claim a transport mode is faster, safer, or better unless you
+actually ran a check for it this turn — a plausible-sounding guess
+about an unchecked option is still an invented fact.
+```
+
+Reinstalled, gateway restarted.
+
+### Verified live: same two questions, both now answered for real
+
+```text
+$ openclaw agent --agent main --message "if I leave at 10:15 for next meeting, best way?"
+🚕 Taxi/drive — arrive 10:38 (22 min early...)
+🚇 Public transport — arrive 10:53 (cuts it close...)
+Take a taxi... Note the drive time (23 min) doesn't include hailing, so book now if you haven't already.
+
+$ openclaw agent --agent main --message "if I leave at 10:30 on taxi, can?"
+🚕 10:30 taxi — arrive 10:53
+That's 3 min past the 10:50 buffer, but still 7 min before the meeting starts...
+```
+
+Both cross-checked against direct `route_compare.py` runs — arrival times matched exactly (`10:53` for the second case, confirmed byte-for-byte). The first question is no longer answered with an unchecked opinion; the second is no longer deferred — both now run a real check and report a real number, with the road-estimate caveat attached unprompted.
+
+---
+
+## 37. Optional Future Work: Grab Farefeed API
+
+Proposed, not built. Logged for later rather than scaffolded now, because — unlike every other integration in this log — there is no account, API key, or confirmed request/response shape to test against. OneMap's real shape was only ever learned by calling the live API (§20, §35); guessing at Grab's from memory would break that pattern.
+
+Grab exposes a Farefeed API that, given pickup/drop-off coordinates, returns:
+
+- available Grab ride services
+- pickup ETA
+- estimated fare range
+- surge level
+- a deep link that opens Grab with pickup/drop-off pre-filled
+
+### Why this matters here specifically
+
+It directly answers the caveat raised twice already, in §35 and again in §36: OneMap's `drive` time is a road-time estimate only, with no idea how long a taxi actually takes to arrive. Grab's own pickup ETA would replace that guess with a real number, add a fare estimate this project has never had, and — new for this project — give the agent a concrete link to hand over instead of only a described time ("tap here to book" instead of "book now if you haven't already"). That last part matches `SKILL.md`'s existing tone rule about concrete actions over abstract time-only language more directly than anything built so far.
+
+### Where it would fit the existing architecture
+
+- `src/grab.py`, parallel to `onemap.py` — a thin client returning something like `{"service": ..., "pickup_eta_minutes": ..., "fare_range": ..., "surge_level": ..., "deep_link": ...}` for a pickup/dropoff pair.
+- Reused the same way `get_drive_time()` is reused today (§35) — by `late_recovery.py` and `route_compare.py`'s `drive`/taxi option. Likely alongside OneMap's road time rather than replacing it (Grab pickup ETA + OneMap road time = a truer door-to-door estimate than either alone).
+- Same fail-closed convention as everything else here: if the Farefeed call fails or returns nothing, fall back to the current OneMap-only road estimate, still labeled as such, rather than block the whole plan.
+
+### What's actually needed before this can be built
+
+- A Grab developer/partner account and Farefeed API credentials — this is a partner API, not self-serve like OneMap, so access itself may need to be requested and approved first.
+- The real request/response shape, confirmed live — endpoint, auth header format, required fields. Nothing should be guessed from memory.
+- A decision on how to phrase surge level and fare range in ADHD-friendly wording without turning the output into a wall of numbers.
+
+This matches `Get_Mooving.md`'s own scope freeze — "Grab/taxi booking" is explicitly listed under "Cut first / not required yet." Leaving it there until credentials exist is following that plan, not a new deferral.
+
+---
+
+## 38. Walk/Cycle + Weather in `route_compare.py`
+
+§35 deliberately left walking and cycling out for `late_recovery.py` — someone already late needs the fastest realistic option, and those modes rarely compete. But `route_compare.py` (§36) is a different context: a general "what if" tool, where a short trip genuinely could be walkable, and where the right call depends on whether it's raining. Revisited on request, and built as one pass rather than two, since weather is what makes recommending walk/cycle trustworthy in the first place — offering "cycle, it's faster" during a thunderstorm would be worse than not offering it.
+
+### Two new external calls, both verified live before writing any wiring
+
+`onemap.py` gained `get_walk_time()` / `get_cycle_time()` — same `routeType` pattern as `drive` (§35), reusing the existing `_request_route`/`_extract_minutes` helpers. Confirmed live first: SUTD → postal 308232 came back as a 175-minute walk / 120-minute cycle, both correctly identified later as unrealistic for that distance.
+
+A new `src/weather.py` calls Singapore's NEA 2-hour forecast (`api.data.gov.sg/v1/environment/2-hour-weather-forecast`) — free, public, no API key or account needed, unlike Grab (§37). Confirmed live: 47 named areas, each with a `label_location` lat/lon and a forecast string. `get_forecast(lat, lon)` finds the nearest area by straight-line distance and classifies the forecast text (`is_rainy`: contains "rain", "shower", or "thundery") into `{"area", "forecast", "rain"}`.
+
+### Gating: straight-line distance, not route distance
+
+A new `onemap.straight_line_km()` (haversine) decides whether walk/cycle are even worth asking about — computed instantly from coordinates already on hand from `search_location()`, with no extra network call. Verified against a real short hop (a within-neighbourhood MRT-to-hub distance, 134m) before picking thresholds: `WALK_MAX_KM = 1.5`, `CYCLE_MAX_KM = 5.0`. Deliberately not using OneMap's own route distance for this — that would mean making the routing call just to decide whether the routing call was worth making.
+
+### `route_compare.py`: gating only applies to `--compare`
+
+`--compare` now checks public transport and drive unconditionally, plus walk if `distance_km <= 1.5` and cycle if `distance_km <= 5.0` — but only when `weather.rain` is false. An explicit `--mode walk` or `--mode cycle` is always honored regardless of distance or rain (same "explicit request bypasses automatic gating" rule as `--destination` in §33) — the caller asked for it directly, so the script answers directly, just with the real (possibly discouraging) number. If the weather call itself fails, `weather` comes back `null` and gating falls back to distance only — a flaky external API doesn't take down the whole comparison, and doesn't silently block cycle either.
+
+Output gained two fields: `distance_km` and `weather` (`{"area", "forecast", "rain"}` or `null`).
+
+### `SKILL.md` updated
+
+Mode-name extraction now covers walk/cycle ("walk"/"on foot", "cycle"/"bike"). A new rule tells the agent it does not need to explain why walk/cycle are missing from a `--compare` result — the script already decided that — but if the user explicitly asks for one anyway despite rain or distance, the agent should surface the weather/distance fact rather than silently going along with it.
+
+### Verified live end to end
+
+Direct script tests confirmed all four combinations: real far-apart data (9.1 km) correctly excluded both from `--compare` while still honoring an explicit `--mode walk` (145 min, clearly shown as impractical); a real short hop (1.5 km) auto-included cycle but correctly excluded walk (1.536 km actual, just over the 1.5 km cutoff — the display rounds to "1.5" but the gate compares the unrounded value, so this is expected, not a bug); a forced rainy forecast excluded cycle at that same short distance; a forced weather-API failure returned `weather: null` without breaking the rest of the comparison.
+
+Then live through the agent, with `calendar_google.get_next_event()` temporarily forced to a 1.5 km meeting (reverted after, confirmed via `git diff`):
+
+```text
+$ openclaw agent --agent main --message "what if I leave at 10:15 for my next meeting, and how would weather affect it?"
+🚕 Drive/taxi   4 min   10:19
+🚇 Public transport   12 min   10:27
+🚲 Cycle   18 min   10:33
+☁️ Weather: Partly cloudy, no rain — cycling is totally fine if you're up for it.
+```
+
+Cycle appeared, walk correctly didn't, and the weather line was a real fact from the JSON, not an assumption.
+
+---
+
+## 39. Development Principles Learned
 
 ### Test one layer at a time
 
@@ -1492,7 +1940,7 @@ Gmail unavailable
 
 ---
 
-## 33. Approximate Repo Structure
+## 40. Approximate Repo Structure
 
 ```text
 get_mooving/
@@ -1511,7 +1959,11 @@ get_mooving/
 │   ├── planner.py
 │   ├── calendar_google.py
 │   ├── onemap.py
-│   └── location_state.py
+│   ├── location_state.py
+│   ├── update_location.py
+│   ├── late_recovery.py
+│   ├── route_compare.py
+│   └── weather.py
 │
 ├── skills/
 │   └── get_mooving/
@@ -1525,7 +1977,7 @@ get_mooving/
 
 ---
 
-## 34. Short Development Summary
+## 41. Short Development Summary
 
 The prototype grew in this order:
 
