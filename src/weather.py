@@ -1,3 +1,9 @@
+"""
+Looks up Singapore's NEA 2-hour weather forecast (free, public, no API
+key) for a coordinate, matched to the nearest of NEA's 47 named areas.
+Used to decide whether walking/cycling are worth suggesting.
+"""
+
 import requests
 
 from onemap import straight_line_km

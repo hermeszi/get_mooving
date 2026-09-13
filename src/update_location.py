@@ -1,3 +1,10 @@
+"""
+Confirms the user is still at their stored starting location, or
+changes it to a new one — validating any new address through OneMap
+first so a typo or ambiguous name can't silently corrupt profile.json.
+This is the only script allowed to write data/profile.json's location.
+"""
+
 import argparse
 import json
 import os

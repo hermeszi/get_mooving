@@ -1,5 +1,6 @@
 {
   "preferred_transport": "public_transport",
+  "notify_email": "you@example.com",
 
   "buffers": {
     "early_arrival_minutes": 10,

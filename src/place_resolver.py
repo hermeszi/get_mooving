@@ -1,3 +1,11 @@
+"""
+Resolves an ambiguous place or brand name (e.g. "McDonald's") to the
+nearest real candidates near a reference point, instead of trusting
+the first geocoding match — which can be a wrong, differently-named
+building entirely (see DEVELOPMENT.md's "macdonal" -> Macdonald House
+incident).
+"""
+
 import argparse
 import json
 

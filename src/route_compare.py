@@ -1,3 +1,12 @@
+"""
+Answers "what if" questions the main planner can't: a hypothetical
+departure time, a specific transport mode, or a different origin/
+destination entirely (e.g. "after class, walk to lunch"). Walk/cycle
+are auto-included only when short enough and not raining; --origin/
+--destination let a trip be compared independently of the next
+calendar event.
+"""
+
 import argparse
 import json
 from datetime import datetime, timedelta

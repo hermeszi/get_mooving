@@ -1,3 +1,9 @@
+"""
+Read-only Google Calendar adapter. Finds the next upcoming timed event
+(title, start, end, location, attendees) via a browser OAuth flow on
+first run, then a cached token thereafter.
+"""
+
 from datetime import datetime, timezone
 from pathlib import Path
 

@@ -1093,10 +1093,13 @@ There is currently no way to feed a user-supplied destination back into `planner
 - [x] real Gmail sending, wired to that same approval flow (§41, `gmail_send.py`) — Day-2 plan fully closed
 - [x] reading Gmail replies, narrow scope — replies on threads this agent sent (§42, `gmail_check_replies.py`)
 - [x] trusted-contacts allowlist for reply senders, with spoofed-display-name protection (§43, `data/trusted_contacts.json`)
+- [x] proactive milestone scheduling mechanism, built and verified live — a real one-shot fired and sent a real email on time (§44, `schedule_milestones.py`)
+- [x] proactive reply-check design, with the third-party-send boundary enforced (§44, `SKILL.md`)
+- [x] documentation cleanup — SKILL.md trimmed 298→121 lines, module docstrings on all 12 scripts, README.md rewritten as a real setup guide (§45)
 
 ### Still being developed
 
-- [ ] proactive scheduled prompts
+- [ ] actually turning on the recurring automations that call schedule_milestones.py / the reply check on an ongoing basis (§44) — mechanism proven live, explicitly held off by user choice ("Not yet") rather than left pending by default
 - [ ] Docker / cloud deployment
 - [ ] WhatsApp as an alternative message channel — still just an idea, per the original roadmap
 - [ ] Gmail inbox as a general command channel, broad scope from §42 — needs its own safety/threat-model design (who can trigger the agent by email, telling a legitimate reply from a crafted one) before building
@@ -2180,7 +2183,88 @@ The one rule that matters most here: **the agent may never edit `data/trusted_co
 
 ---
 
-## 44. Development Principles Learned
+## 44. Proactive Milestone Reminders — the Day-3 "Key Feature"
+
+Two asks at once: (1) check email and reply if necessary, (2) proactive ⏳🎒🚪 nudges without being asked — explicitly called out as the key remaining feature, matching `Get_Mooving.md`'s original Day-3 plan almost verbatim.
+
+### Checked before designing anything: is there anywhere for a proactive message to even go?
+
+`openclaw channels list --all` — every chat channel (Telegram, WhatsApp, Discord, Slack, SMS, all thirty-odd listed) is "not installed, not configured, disabled." Zero. The only real, working, tested delivery mechanism this entire project has is Gmail (§41). So "proactive prompts" could not ride on OpenClaw's native channel system at all — it would have to be email, or building a whole new channel integration first. Asked directly; answer was email, reusing `gmail_send.py`.
+
+### `planner.py` refactored: `resolve_plan()`
+
+The milestone scheduler needs the exact same location/destination/route resolution `planner.py`'s CLI already does, with real `datetime` objects (not the JSON's HH:MM strings — re-parsing those back into full datetimes risks a date-rollover bug near midnight that using the real objects avoids entirely). Rather than duplicate that ~60-line block a third time, `planner.py`'s core logic was extracted into `resolve_plan(destination_override=None)`, returning `{"ok": True, "event", "plan", "profile"}` or `{"ok": False, "error", "message", ...}`. `main()` now just calls it and formats the result; behavior verified byte-identical before/after across every path (success, no event, no destination, `--destination` override) — this was a pure refactor, zero behavior change, confirmed by direct comparison.
+
+### `notify_email` in `profile.json`
+
+A `mingde@gmail.com`, in `profile.json` (already gitignored) — where to actually send proactive nudges and automated notifications. Deliberately kept separate from `trusted_contacts.json` (§43): that file answers "who is allowed to be trusted as a *sender*," this answers "who is the *owner* to notify" — different questions, even though today they happen to share a value.
+
+### `src/schedule_milestones.py`
+
+```text
+Calendar event
+      ↓
+planner generates milestones     (resolve_plan(), reused not duplicated)
+      ↓
+scheduler waits                  (openclaw automations, one-shot --at)
+      ↓
+⏳ Wrap this up.   🎒 Get ready.   🚪 Go now.
+```
+
+For each of the three milestones still in the future, schedules a one-shot `openclaw automations add --at <exact time> --command "...gmail_send.py --to ... --subject ... --body ..." --delete-after-run`. Deliberately a **command** payload, not an agent-message: the content is fully known in advance (which milestone, which event, what time) — there's no judgment call left for a model to make, so it bypasses the LLM entirely for the actual reminder. Same "Python does the mechanical part" principle as every other script in this log, taken to its natural conclusion: even the *delivery* of a fully-determined message doesn't need a model in the loop.
+
+### A real bug found while testing: `--declaration-key` does not dedupe
+
+The plan was to rely on `--declaration-key`'s documented "idempotent declaration identity" to make repeated runs a no-op. Tested directly: ran the script twice, got two of every job. `openclaw automations add` does not check for an existing job with the same key before creating a new one — confirmed by inspecting `openclaw automations list` and seeing duplicate `declarationKey` values side by side. Fixed by doing the idempotency check in Python instead: `existing_declaration_keys()` lists current jobs first and the scheduling loop skips any milestone whose key is already present. A second real bug in the *test*, not the script, was caught in the same pass: the first idempotency test used `datetime.now() + timedelta(...)` for the fake event's start time, which recomputes a different value on every call — so the declaration key (built from the event's start) was different every run regardless of any dedup logic. Switched the test fixture to a fixed ISO timestamp and re-verified: first run scheduled three jobs, second and third runs scheduled zero, `openclaw automations list` showed exactly one job per milestone throughout.
+
+### Verified live: a real one-shot actually firing
+
+Scheduled a minimal two-minutes-out test directly (bypassing milestone math, to isolate the one truly unverified mechanism: does `automations add --command ... --delete-after-run` actually fire and clean up). Confirmed via `openclaw automations runs`:
+
+```json
+{"action": "finished", "status": "ok", "completionStatus": "succeeded",
+ "summary": "{\"status\": \"sent\", \"message_id\": \"1a098bc5a6db1b9a\", \"to\": \"mingde@gmail.com\"}"}
+```
+
+Fired within a second of its scheduled time, ran the real command, `gmail_send.py` returned a genuine `message_id`, and the job was gone from `openclaw automations list` afterward — `--delete-after-run` worked once `--no-deliver` was added (without it, OpenClaw's own "announce" delivery fails closed with no channel configured, which per the CLI's own docs would have left the job disabled instead of deleted).
+
+### `SKILL.md`: two new sections, plus a real safety boundary for the automated case
+
+**"Proactive Milestone Reminders"** documents `schedule_milestones.py` as something that runs on its own schedule, not something the agent reasons about each time. **"Proactive Reply Check (Automation)"** extends §42's reply-checking into a scheduled context, with one rule that didn't exist before because it didn't need to: in a scheduled run, the agent may email the *owner* a summary and a suggested draft, but must never email the original correspondent — replying to a third party still requires the owner to come back in a live conversation and approve it through the existing draft/approve/send flow (§40/§41). A scheduled run can notify; it cannot act on the user's behalf toward someone else. This is the "reply if necessary" half of the ask, deliberately kept short of "auto-send if necessary" — consistent with the mandatory-approval rule that's been unconditional since §40.
+
+### Not yet done: actually turning the recurring jobs on
+
+Everything above is built, tested, and proven to fire correctly. What's not done yet: creating the actual *recurring* automations (e.g. every 30 minutes) that call `schedule_milestones.py` and the reply-check on an ongoing basis. Building the mechanism and activating an indefinite background job that emails the user on a schedule forever are different in kind — the former is safe to do and undo freely, the latter keeps running and consuming resources/sending real email until someone turns it off. Asked directly before flipping anything on; answer was **"Not yet."** Both mechanisms are ready to activate whenever wanted — nothing further needs building, just the two `openclaw automations add` calls (one `--every 30m` running `schedule_milestones.py`, one similar cadence for the reply check) when the go-ahead comes.
+
+---
+
+## 45. Documentation Cleanup
+
+By §44, `SKILL.md` had grown to 298 lines across eleven sections — planner rules, location confirmation, late recovery, reply checking, two proactive-automation sections, hypothetical routes, trip chaining, place resolution — reading more like a manual for the whole project than a runtime instruction file. Flagged directly, with a proposed split:
+
+- **`SKILL.md`** — runtime operating instructions only.
+- **`DEVELOPMENT.md`** — why things work this way (already its job).
+- **`Get_Mooving.md`** — product design/proposal (already its job).
+
+### `SKILL.md`: 298 lines → 121
+
+The main win wasn't moving prose elsewhere — it was collapsing eleven sections into seven and removing the same sentence repeated six different ways. Every section had its own version of "never calculate/invent this value yourself." Replaced with one **"Data Rules"** block near the top covering all of it — times, routes, distances, weather, lateness, reply content — once, plus the shared facts about how every script's JSON success/error shape works. Sections that were really the same workflow got merged: "Checking for Replies" + "Proactive Reply Check" became one section with a live-vs-automated split at the point where the behavior actually diverges; "Hypothetical Departure or Mode" + "Trip Chaining" + "Ambiguous Place Names" became one "Route Comparison" section, since all three are steps in the same decision (resolve origin/destination → resolve an ambiguous place if needed → run the comparison), not three separate features.
+
+Nothing load-bearing was cut — every exact command, every JSON shape, every hard safety rule (never claim sent without `"status": "sent"`, never edit the trust list, never email a third party from an automated run, etc.) is still there, just not restated per-section. Verified by reinstalling and re-running the actual live regression tests afterward (main plan, route comparison) — identical real numbers, nothing broken.
+
+### Module docstrings added to all twelve scripts
+
+Each `src/*.py` file now opens with a short docstring stating what it does and, where it matters, a load-bearing fact a reader would otherwise have to dig for (`onemap.py`: tokens expire ~3 days; `planner.py`: `resolve_plan()` is the shared entry point three other scripts reuse; `schedule_milestones.py`: why it's a command payload, not an agent prompt). Compiled and functionally regression-tested across every script afterward — no behavior changed, only documentation added.
+
+### `README.md` rewritten as a setup/usage guide
+
+The old README was two lines and three leftover shell commands. Rewritten from scratch as an actual guide: prerequisites, venv setup, Google Calendar OAuth (its own client), Gmail OAuth (a **separate** client — confirmed in §41 they're genuinely different connected accounts, `hermeszicrab@gmail.com` vs. `mingde@gmail.com`), OneMap token setup and its ~3-day expiry (confirmed against the real token's JWT claims earlier this session — `exp - iat` is exactly 259200 seconds), profile/trusted-contacts setup, installing the skill, example usage commands, how to turn on the proactive automations (§44, still inactive by default), and a disconnection/privacy table listing every local file this project creates and exactly how to remove each one.
+
+A missing `.env.example` was also created — `.gitignore` already had an unignore rule for it (`!.env.example`) from early in the project, but the file itself had never actually been added.
+
+---
+
+## 46. Development Principles Learned
 
 ### Test one layer at a time
 
@@ -2241,7 +2325,7 @@ Gmail unavailable
 
 ---
 
-## 45. Approximate Repo Structure
+## 47. Approximate Repo Structure
 
 ```text
 get_mooving/
@@ -2250,6 +2334,7 @@ get_mooving/
 ├── requirements.txt
 ├── run_planner.sh
 ├── .gitignore
+├── .env.example
 │
 ├── data/
 │   ├── mock_calendar.json
@@ -2270,7 +2355,8 @@ get_mooving/
 │   ├── weather.py
 │   ├── place_resolver.py
 │   ├── gmail_send.py
-│   └── gmail_check_replies.py
+│   ├── gmail_check_replies.py
+│   └── schedule_milestones.py
 │
 ├── skills/
 │   └── get_mooving/
@@ -2286,7 +2372,7 @@ get_mooving/
 
 ---
 
-## 46. Short Development Summary
+## 48. Short Development Summary
 
 The prototype grew in this order:
 

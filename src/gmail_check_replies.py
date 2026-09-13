@@ -1,3 +1,11 @@
+"""
+Checks every thread gmail_send.py has sent for a reply from someone
+other than the connected account. A reply found is reported once (the
+thread stops being watched); each reply is flagged "trusted" or not by
+checking the real sender address against data/trusted_contacts.json,
+not the display name, which can say anything.
+"""
+
 import argparse
 import json
 import os

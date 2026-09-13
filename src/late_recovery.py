@@ -1,3 +1,10 @@
+"""
+"I'm running late" recovery: recomputes travel from right now (not the
+original planned departure) for the next calendar event, comparing
+public transport and drive side by side, so the plan can react to a
+slipped schedule instead of just repeating stale numbers.
+"""
+
 import argparse
 import json
 from datetime import datetime, timedelta

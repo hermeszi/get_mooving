@@ -1,3 +1,10 @@
+"""
+Sends an email through the Gmail API (a separate connected account and
+OAuth scope from calendar_google.py). Every successful send is recorded
+in data/watched_threads.json so gmail_check_replies.py can later check
+whether that thread got a reply.
+"""
+
 import argparse
 import base64
 import json

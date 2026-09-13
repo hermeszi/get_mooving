@@ -1,3 +1,10 @@
+"""
+Decides whether the user's stored starting location is still fresh
+enough to trust (confirmed within FRESHNESS_LIMIT), and builds the
+confirmation prompt to show when it isn't. Shared by every script that
+needs a starting point, so the same staleness rule applies everywhere.
+"""
+
 from datetime import datetime, timedelta
 
 

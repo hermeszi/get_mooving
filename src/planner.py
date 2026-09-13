@@ -1,3 +1,12 @@
+"""
+The core deterministic planner. Computes the full departure plan for
+the next calendar event — wrap-up, get-ready, leave, and arrival times
+— from the meeting time, live travel time, and the user's buffers.
+resolve_plan() is the shared entry point reused by late_recovery.py
+and schedule_milestones.py so this resolution logic exists in one
+place, not three.
+"""
+
 import argparse
 import json
 from datetime import datetime, timedelta
@@ -105,69 +114,59 @@ def print_plan(plan: dict, event: dict) -> None:
     )
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Print the plan (or any failure) as JSON instead of text.",
-    )
-    parser.add_argument(
-        "--destination",
-        help="Destination to use when the calendar event has no location.",
-    )
-    args = parser.parse_args()
+def resolve_plan(destination_override: str = None) -> dict:
+    """
+    Compute the full plan for the next calendar event. Shared by
+    planner.py's CLI and by anything else that needs the same
+    resolution (e.g. schedule_milestones.py) without duplicating the
+    location/destination/route logic.
 
-    def emit_error(reason: str, message: str, **extra) -> None:
-        if args.json:
-            print(json.dumps({"error": reason, "message": message, **extra}))
-        else:
-            print(message)
+    Returns {"ok": True, "event": ..., "plan": ..., "profile": ...}
+    or {"ok": False, "error": ..., "message": ..., **extra}.
+    """
 
     event = get_next_event()
     profile = load_json("profile.json")
 
     if not event:
-        emit_error("no_upcoming_event", "No upcoming timed events found.")
-        return
+        return {"ok": False, "error": "no_upcoming_event", "message": "No upcoming timed events found."}
 
     if not event.get("location"):
-        if args.destination:
-            event["location"] = args.destination
+        if destination_override:
+            event["location"] = destination_override
         else:
-            emit_error(
-                "no_destination",
-                f"'{event['title']}' has no location set. "
-                "Cannot calculate travel time without a destination.",
-                event=event["title"],
-            )
-            return
+            return {
+                "ok": False,
+                "error": "no_destination",
+                "message": (
+                    f"'{event['title']}' has no location set. "
+                    "Cannot calculate travel time without a destination."
+                ),
+                "event": event["title"],
+            }
 
     location = profile["location"]
 
     if not is_location_fresh(location.get("confirmed_at"), datetime.now().astimezone()):
-        emit_error(
-            "location_confirmation_required",
-            location_confirmation_prompt(location["label"]),
-            label=location["label"],
-        )
-        return
+        return {
+            "ok": False,
+            "error": "location_confirmation_required",
+            "message": location_confirmation_prompt(location["label"]),
+            "label": location["label"],
+        }
 
     meeting_time = datetime.fromisoformat(event["start"])
-
     buffers = profile["buffers"]
 
     try:
         start_location = search_location(location["address"])
     except ValueError as error:
-        emit_error("start_location_not_found", str(error))
-        return
+        return {"ok": False, "error": "start_location_not_found", "message": str(error)}
 
     try:
         destination = search_location(event["location"])
     except ValueError as error:
-        emit_error("destination_not_found", str(error))
-        return
+        return {"ok": False, "error": "destination_not_found", "message": str(error)}
 
     #do one rough estimate
     rough_departure = meeting_time - timedelta(
@@ -204,6 +203,39 @@ def main():
         prep_minutes=buffers["prep_minutes"],
         task_switch_minutes=buffers["task_switch_minutes"],
     )
+
+    return {"ok": True, "event": event, "plan": plan, "profile": profile}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the plan (or any failure) as JSON instead of text.",
+    )
+    parser.add_argument(
+        "--destination",
+        help="Destination to use when the calendar event has no location.",
+    )
+    args = parser.parse_args()
+
+    def emit_error(reason: str, message: str, **extra) -> None:
+        if args.json:
+            print(json.dumps({"error": reason, "message": message, **extra}))
+        else:
+            print(message)
+
+    result = resolve_plan(destination_override=args.destination)
+
+    if not result["ok"]:
+        extra = {k: v for k, v in result.items() if k not in ("ok", "error", "message")}
+        emit_error(result["error"], result["message"], **extra)
+        return
+
+    event = result["event"]
+    plan = result["plan"]
+    profile = result["profile"]
 
     if args.json:
         print(json.dumps(build_result(event, plan, profile["preferred_transport"])))

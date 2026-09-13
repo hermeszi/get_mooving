@@ -1,3 +1,11 @@
+"""
+Thin client for Singapore's OneMap API: geocoding/POI search
+(search_location, search_places) and travel-time routing across
+public transport, drive, walk, and cycle. Needs ONEMAP_TOKEN in .env —
+OneMap tokens expire roughly every 3 days and must be refreshed
+manually (see README).
+"""
+
 import os
 import math
 import requests
