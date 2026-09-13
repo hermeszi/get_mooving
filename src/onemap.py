@@ -232,6 +232,17 @@ def _start_end_params(start: dict, destination: dict) -> dict:
     }
 
 
+def _same_point(a: dict, b: dict, threshold_km: float = 0.05) -> bool:
+    """
+    OneMap's routing endpoint 404s on a same-point request (e.g. an
+    event whose location is the user's own starting address) instead
+    of returning a real "0 minutes" answer. Checked before calling it
+    at all, using coordinates already on hand — no extra API call.
+    """
+
+    return straight_line_km(a, b) < threshold_km
+
+
 def get_public_transport_time(
     start: dict,
     destination: dict,
@@ -240,6 +251,9 @@ def get_public_transport_time(
     """
     Return public-transport journey time in minutes.
     """
+
+    if _same_point(start, destination):
+        return 0
 
     params = {
         **_start_end_params(start, destination),
@@ -263,6 +277,9 @@ def get_drive_time(
     Return driving (car/taxi) journey time in minutes.
     """
 
+    if _same_point(start, destination):
+        return 0
+
     params = {
         **_start_end_params(start, destination),
         "routeType": "drive",
@@ -282,6 +299,9 @@ def get_walk_time(
     Return walking journey time in minutes.
     """
 
+    if _same_point(start, destination):
+        return 0
+
     params = {
         **_start_end_params(start, destination),
         "routeType": "walk",
@@ -300,6 +320,9 @@ def get_cycle_time(
     """
     Return cycling journey time in minutes.
     """
+
+    if _same_point(start, destination):
+        return 0
 
     params = {
         **_start_end_params(start, destination),

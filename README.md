@@ -136,14 +136,21 @@ The ⏳🎒🚪 nudges (emailed automatically, no need to ask) run on two script
 .venv/bin/python3 src/gmail_check_replies.py --json   # checks for new replies
 ```
 
-To make either run on its own schedule:
+To make either run on its own schedule, use the **full absolute path** to `.venv/bin/python3` — not a relative one. A recurring automation doesn't execute from this project's directory, so a relative `.venv/bin/python3` resolves against whatever Python it happens to find there instead, missing every package this project needs (confirmed by hitting exactly this: `ModuleNotFoundError: No module named 'google'`):
 
 ```bash
 openclaw automations add --every 30m --name gm-schedule-milestones \
-  --command ".venv/bin/python3 $(pwd)/src/schedule_milestones.py" --no-deliver
+  --command "/home/ming/42/openclaw/get_mooving/.venv/bin/python3 /home/ming/42/openclaw/get_mooving/src/schedule_milestones.py" \
+  --no-deliver
 ```
 
-List/remove with `openclaw automations list` / `openclaw automations rm <id>`.
+`add` prints the new job's `id` in its JSON output. To make it check immediately as well as on the recurring schedule (an `--every` job's first run only happens after the full interval, not right away):
+
+```bash
+openclaw automations run <id>
+```
+
+This runs it once immediately without disturbing the recurring schedule. List/remove with `openclaw automations list` / `openclaw automations rm <id>` (both need the job's `id`, not its `--name`).
 
 ## 10. Disconnecting / privacy
 

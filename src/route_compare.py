@@ -11,7 +11,7 @@ import argparse
 import json
 from datetime import datetime, timedelta
 
-from calendar_google import get_next_event
+from calendar_google import get_next_event, get_current_event
 from onemap import (
     search_location,
     get_public_transport_time,
@@ -20,7 +20,7 @@ from onemap import (
     get_cycle_time,
     straight_line_km,
 )
-from location_state import is_location_fresh, location_confirmation_prompt
+from location_state import needs_confirmation, location_confirmation_prompt
 from planner import load_json, format_24h
 from weather import get_forecast
 
@@ -167,11 +167,12 @@ def main():
             return
     else:
         location = profile["location"]
+        current_event = get_current_event()
 
-        if not is_location_fresh(location.get("confirmed_at"), datetime.now().astimezone()):
+        if needs_confirmation(location.get("confirmed_at"), location["address"], datetime.now().astimezone(), current_event):
             emit_error(
                 "location_confirmation_required",
-                location_confirmation_prompt(location["label"]),
+                location_confirmation_prompt(location["label"], current_event),
                 label=location["label"],
             )
             return

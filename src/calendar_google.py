@@ -4,7 +4,7 @@ Read-only Google Calendar adapter. Finds the next upcoming timed event
 first run, then a cached token thereafter.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -59,13 +59,13 @@ def get_next_event():
         credentials=creds,
     )
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
 
     result = (
         service.events()
         .list(
             calendarId="primary",
-            timeMin=now,
+            timeMin=now.isoformat(),
             maxResults=10,
             singleEvents=True,
             orderBy="startTime",
@@ -81,6 +81,13 @@ def get_next_event():
         start = event.get("start", {}).get("dateTime")
 
         if not start:
+            continue
+
+        # Google's timeMin filters by end time, not start time, so an
+        # event already in progress (started, not yet ended) is still
+        # returned here. It's not the "next" thing to prepare for, so
+        # skip anything that has already started.
+        if datetime.fromisoformat(start) <= now:
             continue
 
         attendees = []
@@ -101,6 +108,55 @@ def get_next_event():
             "location": event.get("location"),
             "attendees": attendees,
         }
+
+    return None
+
+
+def get_current_event():
+    """
+    Find the event happening right now (start <= now < end), if any.
+    Used to sanity-check the stored starting location: a location can
+    be "fresh" by timestamp yet clearly wrong if the calendar shows
+    the user should currently be somewhere else entirely.
+    """
+
+    creds = get_credentials()
+
+    service = build(
+        "calendar",
+        "v3",
+        credentials=creds,
+    )
+
+    now = datetime.now(timezone.utc)
+
+    result = (
+        service.events()
+        .list(
+            calendarId="primary",
+            timeMin=(now - timedelta(hours=12)).isoformat(),
+            timeMax=now.isoformat(),
+            maxResults=10,
+            singleEvents=True,
+            orderBy="startTime",
+        )
+        .execute()
+    )
+
+    for event in result.get("items", []):
+        start = event.get("start", {}).get("dateTime")
+        end = event.get("end", {}).get("dateTime")
+
+        if not start or not end:
+            continue
+
+        if datetime.fromisoformat(start) <= now < datetime.fromisoformat(end):
+            return {
+                "title": event.get("summary", "Untitled event"),
+                "start": start,
+                "end": end,
+                "location": event.get("location"),
+            }
 
     return None
 

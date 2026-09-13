@@ -12,9 +12,9 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from calendar_google import get_next_event
+from calendar_google import get_next_event, get_current_event
 from onemap import search_location, get_public_transport_time
-from location_state import is_location_fresh, location_confirmation_prompt
+from location_state import needs_confirmation, location_confirmation_prompt
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -146,12 +146,13 @@ def resolve_plan(destination_override: str = None) -> dict:
             }
 
     location = profile["location"]
+    current_event = get_current_event()
 
-    if not is_location_fresh(location.get("confirmed_at"), datetime.now().astimezone()):
+    if needs_confirmation(location.get("confirmed_at"), location["address"], datetime.now().astimezone(), current_event):
         return {
             "ok": False,
             "error": "location_confirmation_required",
-            "message": location_confirmation_prompt(location["label"]),
+            "message": location_confirmation_prompt(location["label"], current_event),
             "label": location["label"],
         }
 

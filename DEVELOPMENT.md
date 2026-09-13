@@ -1096,13 +1096,19 @@ There is currently no way to feed a user-supplied destination back into `planner
 - [x] proactive milestone scheduling mechanism, built and verified live — a real one-shot fired and sent a real email on time (§44, `schedule_milestones.py`)
 - [x] proactive reply-check design, with the third-party-send boundary enforced (§44, `SKILL.md`)
 - [x] documentation cleanup — SKILL.md trimmed 298→121 lines, module docstrings on all 12 scripts, README.md rewritten as a real setup guide (§45)
+- [x] recurring `gm-schedule-milestones` automation actually turned on (by the user, via the README example) — a real bug in that example (relative venv path) was caught and fixed in both the live job and the docs (§46)
+- [x] `get_next_event()` fixed to skip already-started events (§47)
+- [x] trusted-sender inbox trigger — new/unsolicited emails, not just replies (§48, `gmail_check_inbox.py`)
+- [x] same-point (start = destination) trips fixed to return 0 minutes instead of crashing (§48, `onemap.py`)
+- [x] location freshness now also checks against a calendar event in progress, not just a timestamp (§49, `location_state.py`/`get_current_event`)
+- [x] `schedule_milestones.py` corrects already-scheduled reminders when the computed time drifts, instead of leaving them stale (§49)
 
 ### Still being developed
 
-- [ ] actually turning on the recurring automations that call schedule_milestones.py / the reply check on an ongoing basis (§44) — mechanism proven live, explicitly held off by user choice ("Not yet") rather than left pending by default
+- [ ] a recurring automation for either email check (`gmail_check_replies.py`/`gmail_check_inbox.py`) — milestone scheduling is live, email-checking isn't yet (on-demand only)
 - [ ] Docker / cloud deployment
-- [ ] WhatsApp as an alternative message channel — still just an idea, per the original roadmap
-- [ ] Gmail inbox as a general command channel, broad scope from §42 — needs its own safety/threat-model design (who can trigger the agent by email, telling a legitimate reply from a crafted one) before building
+- [ ] WhatsApp as a real OpenClaw channel — would give genuine push for that channel; still just an idea, per the original roadmap
+- [ ] Gmail inbox as an *open* command channel (any sender, not just the allowlist) — §48 closed the trusted-sender case; a fully open inbox still needs its own safety/threat-model design before building
 
 ### Optional, blocked on external access
 
@@ -2264,7 +2270,132 @@ A missing `.env.example` was also created — `.gitignore` already had an unigno
 
 ---
 
-## 46. Development Principles Learned
+## 46. Automation Timing, and a Real Bug Caught by the User's Own Testing
+
+Two questions after §45's README went out: does an `--every` automation check immediately when created or only after the interval, and can it do both — check now, then keep checking on schedule.
+
+### Answered empirically, not from memory
+
+Created a real `--every 2m` test job and read its own JSON back: `nextRunAtMs` was exactly `createdAtMs + intervalMs` — confirmed the first run only happens after the full interval, never immediately. Then found `openclaw automations run <id>` (listed as "debug" in the CLI's own help, but works fine here) and tested whether it disturbs the schedule: ran it manually on a separate test job, compared `nextRunAtMs` before and after — byte-identical. So the answer is: create the automation, then `openclaw automations run <id>` once to also get an immediate check, and the recurring cadence is untouched either way. Both test jobs (and a stray background polling loop from a flawed wait-condition) cleaned up afterward.
+
+### While checking this, found two real automations already active
+
+`openclaw automations list` showed two live `gm-schedule-milestones` jobs, created a few minutes apart, that this session never created. The user's IDE selection at the top of this exchange was the exact README lines with that command — the likely explanation is they tried it themselves (possibly twice). Asked directly whether to keep both or remove the duplicate; removed one.
+
+### The one that remained was actually broken
+
+Ran the surviving job manually to demonstrate it working — it failed:
+
+```text
+ModuleNotFoundError: No module named 'google'
+```
+
+The README's example command was the bug: `.venv/bin/python3 $(pwd)/src/schedule_milestones.py` — `$(pwd)` correctly made the *script* path absolute at the moment the command was typed, but `.venv/bin/python3` itself stayed relative. A recurring automation doesn't execute from this project's directory, so the relative interpreter path resolved against some other Python that exists there instead — one without any of this project's packages installed. Exactly the class of mistake §10 already documented for `run_planner.sh` ("OpenClaw runs as a service and does not inherit the terminal's activated virtualenv"), just resurfacing in a new example that hadn't been written yet when that lesson was first learned.
+
+Fixed both the live job (`openclaw automations edit <id> --command "<full absolute paths>"`) and the README example, then re-ran the corrected job to confirm: `"Nothing scheduled (no future milestones)"` — correctly reflecting that today's real event's milestones have already passed. `nextRunAtMs` was unchanged by the edit, confirming the fix didn't touch the schedule, only the broken command.
+
+README updated with the corrected full-path example, plus the `openclaw automations run <id>` immediate-check pattern and a note that both `run` and `rm` need the job's `id`, not its `--name`.
+
+---
+
+## 47. `get_next_event()` Was Stuck on an Already-Started Event
+
+Reported as "I'm still waiting for some responses" after §46 — the user had added a new event ("Go home," 18:00) and sent an email asking about their next appointment. Neither produced anything. The email question was explainable immediately (§42's deliberate narrow scope — confirmed by checking `data/watched_threads.json`: empty, so `gmail_check_replies.py` had nothing to check; an unsolicited new email was never going to be visible to it). The missing "Go home" reminder was not explainable that way, and turned out to be a real bug.
+
+### The bug
+
+`calendar_google.get_next_event()` queries with `timeMin=now`, expecting that to mean "events starting from now." It doesn't — Google's Calendar API defines `timeMin` as a filter on an event's **end** time, not its start. `Coding class` (11:00–17:30) was still mid-session when this was checked (current time ~12:11), so it kept being returned as the calendar's first result, sorted before `Go home` (18:00) by `orderBy=startTime` — even though `Coding class` had already started nearly an hour and a half earlier. Confirmed directly by pulling the raw event list: both events were present and correctly ordered by start time, but the code was taking the first item without checking whether it had already begun.
+
+Every script in the project resolves the "next event" through this one function (`planner.py`, `late_recovery.py`, `route_compare.py`'s default mode, and `schedule_milestones.py` via `resolve_plan()`) — so this wasn't a one-script bug, it silently affected the entire pipeline whenever the calendar's earliest-by-start-time event happened to already be in progress. That's exactly why `schedule_milestones.py` kept reporting "nothing scheduled" even after `Go home` existed: it was still resolving against `Coding class`'s already-passed milestones and never got far enough to see the real next event.
+
+### The fix
+
+```python
+if datetime.fromisoformat(start) <= now:
+    continue  # already started — not the "next" thing to prepare for
+```
+
+One added check in the existing loop. Verified immediately against the real calendar: before the fix, `calendar_google.py` returned `Coding class`; after, it correctly returns `Go home`. Re-ran `planner.py`, `late_recovery.py`, `route_compare.py`, and `schedule_milestones.py` — all four now resolve against `Go home` instead (each correctly reporting `no_destination`, since that event genuinely has no location set on the calendar — a separate, expected condition, not a bug).
+
+### Live-tested the resolved case, hit a legitimate edge case
+
+Asked the live agent "when should I leave for my next appointment?" — correctly identified `Go home` and asked for a destination (no hallucinated guess). Answered with the user's own home address, and it hit a real OneMap 404: start and destination geocoded to the same coordinates, because the profile's confirmed current location *is* home in this environment, so "go home" from home is a same-point trip. The agent correctly diagnosed this as a routing anomaly and asked for a more specific address rather than inventing a travel time — not a new bug, just this demo environment's data being self-referential for this particular event.
+
+---
+
+## 48. Trusted-Sender Inbox Trigger, and Two More Real Bugs
+
+Follow-up to §47: "isn't my email trusted, same as WhatsApp later? And shouldn't a new email or WhatsApp message be able to trigger something?" Untangled two conflated ideas first: `trusted_contacts.json` governs whether a *reply to a sent thread* is trusted — it says nothing about whether a brand-new, unsolicited email gets looked at, which is a different axis entirely (`gmail_check_replies.py` only ever checks thread IDs it already knows about). True event-driven push was scoped honestly: WhatsApp would get it for free once actually connected as an OpenClaw channel (not yet); Gmail push exists (watch + Cloud Pub/Sub) but is real infrastructure with a 7-day re-registration cycle, overkill here — fast polling is the practical answer for a personal project. Chose, with the user: extend the *scope* (also watch the inbox, not just replies) rather than chase true push for Gmail specifically.
+
+### `src/gmail_check_inbox.py`
+
+Scans the inbox (not just known threads) for messages from anyone in `trusted_contacts.json` — everyone else is silently skipped and never re-checked (a watermark, `data/inbox_watermark.json`, advances past every message inspected regardless of trust, so an ignored stranger's mail doesn't get re-fetched forever). Explicitly skips any message whose thread is currently in `watched_threads.json`, so a message is never handled by both this script and `gmail_check_replies.py`.
+
+One safety distinction baked in from the start, not added after the fact: each surfaced message carries `is_owner` — whether the sender is the connected account itself / `profile.json`'s `notify_email`. `is_owner: true` (the user emailing their own agent) can be answered and replied to directly, no approval needed — functionally identical to asking a question over the terminal, just delivered by a different channel. `is_owner: false` (some other trusted contact, once the allowlist grows beyond just the owner) must not be auto-answered — the owner gets notified instead, same shape as §42's automated reply-check boundary. Verified with a controlled mock covering all three cases at once: a trusted-owner message (surfaced), an untrusted stranger's message (silently skipped, but still advances the watermark), and a message in a currently-watched thread (skipped entirely, left for `gmail_check_replies.py`).
+
+Also, this immediately surfaced a real message: the user's actual "When's my next appointment?" email, sent cold with no prior thread — exactly the case this was built for.
+
+### Real bug: two routing misses, both about the word "email"
+
+Wiring the new script into `SKILL.md` and asking "check my email for new messages" live — twice, with different phrasing — produced the model confidently claiming *no email integration exists* and offering to set up OpenClaw's own IMAP/email channel plugin instead. Not a hallucinated tool call this time (§29's class of bug); a routing miss where "email" as a bare word evidently cues the model toward OpenClaw's own channel/plugin system before it even considers this skill's own (real, working) `gmail_*.py` scripts. Confirmed the skill itself still routes fine for anything with "reply" or "late message" in it — this was specific to generic "email"/"inbox" phrasing. Fixed with an explicit line in `AGENTS.md`'s routing rule naming the confusion directly: "check my email" for this project means the skill's own scripts, never OpenClaw's IMAP/channel setup. Reinstalled, restarted, retested — worked immediately: ran both checks, correctly identified two owner messages, attempted a real answer, and — because the real answer hit the next bug below — replied honestly that it couldn't compute one yet, rather than inventing something. Confirmed genuine via `data/watched_threads.json`: two real sent messages, real IDs, timestamps matching the test.
+
+### Real bug: same-point trips crashed instead of computing 0
+
+The reason the honest attempted answer failed: the user had added a location to the real "Go home" event (their own home address) — good, that's exactly what §47 suggested. But their confirmed current location *is* home, so "go home" from home is a same-point trip, and OneMap's routing endpoint 404s on that instead of returning a real "0 minutes." Every travel-time function in `onemap.py` was calling the API unconditionally with no check for this. Fixed with one shared helper checked before any of the four functions (`get_public_transport_time`/`get_drive_time`/`get_walk_time`/`get_cycle_time`) call the API at all:
+
+```python
+def _same_point(a, b, threshold_km=0.05):
+    return straight_line_km(a, b) < threshold_km
+```
+
+Verified against the real "Go home" event across all three dependent scripts — `planner.py` now produces a coherent plan (`physical_departure` equals `arrival_target`, since there's no travel component), `late_recovery.py` and `route_compare.py` both correctly show 0-minute options instead of crashing. Also re-verified a real, different-location trip (home → SUTD) still computes normally (64 min transit, 30 min drive) — the 50-metre threshold doesn't false-positive on legitimate short trips.
+
+---
+
+## 49. "Isn't the Agent Supposed to Ask Where I Am?"
+
+A sharp catch after §48: "Go home" was resolving from the stored "Home" location, even though the user would obviously be leaving from their 11am class (still in progress) instead. Confirmed directly: `is_location_fresh` only checks a timestamp against `FRESHNESS_LIMIT` (2 hours) — it has no idea what the calendar says. "Home" had been confirmed at 11:29, well within the window, so it read as trustworthy by the clock alone while being clearly wrong in fact.
+
+### The fix: freshness and calendar-agreement are two separate checks
+
+New `calendar_google.get_current_event()` finds whatever event is happening *right now* (`start <= now < end`) — distinct from `get_next_event()` (§47), which deliberately excludes anything already started. `location_state.py` gained `conflicts_with_calendar()` (does the in-progress event's location disagree with the stored address?) and `needs_confirmation()`, which combines both checks — stale by timestamp, or contradicted by the calendar, either one is enough to ask again. All three consumers (`planner.py`, `late_recovery.py`, `route_compare.py`) switched from calling `is_location_fresh` directly to this combined check, each now also fetching `get_current_event()`.
+
+The prompt itself became context-aware — `location_confirmation_prompt()` now takes the current event and, when there's a real conflict, names it specifically:
+
+```text
+📍 Coding class runs until 5:30 PM at 22 Havelock Rd — are you leaving
+from there, or from Home?
+1. Coding class   2. Home   3. Somewhere else
+```
+
+instead of the generic "still starting from Home?" that gave no hint anything was actually wrong.
+
+### A second bug surfaced by the live agent itself, mid-conversation
+
+Testing this live — the agent correctly asked the new conflict question, and answering "1" correctly ran `update_location.py --address ... --label "Coding class"`. But OneMap canonicalized the address to `"22 HAVELOCK ROAD SINGAPORE 160022"`, textually different from the calendar's own `"22 Havelock Rd, Singapore 160022"` (different casing, "Rd" vs "Road"). The first version of `conflicts_with_calendar()` compared these as plain strings, which would have read them as *still* different places — re-triggering the same confirmation prompt in a loop immediately after it was just answered. The live agent, working the request, patched `location_state.py` itself to compare by postal code first (extracted via regex from both strings) before falling back to raw equality — confirmed the fix by reading the file back afterward rather than assuming it was safe, then re-ran `planner.py`: no repeated prompt, clean plan, correct origin.
+
+### A third, quieter bug: stale automations
+
+Once the origin corrected from Home to Coding class, the *previously scheduled* milestone reminders (§44, already live since earlier today) kept their old, now-wrong times — `schedule_milestones.py`'s idempotency only checked whether a declaration key existed, never whether its scheduled time still matched what's currently computed. Fixed by comparing the existing job's `at` against the freshly computed time (as real datetimes, not strings, since the same instant can be written multiple valid ways) and calling `openclaw automations edit <id> --at <corrected time>` in place when they'd drifted, rather than leaving a wrong reminder sitting there or silently skipping it. Verified against the real, already-scheduled jobs: all three corrected to the Coding-class-based times, same job IDs (edited, not duplicated), and a follow-up run confirmed a clean no-op.
+
+### Verified end to end
+
+```text
+$ openclaw agent --agent main --message "when should I leave for my next appointment?"
+📍 Coding class runs until 5:30 PM at 22 Havelock Rd, Singapore 160022 —
+are you leaving from there, or from Home?
+1. Coding class  2. Home  3. Somewhere else
+
+$ openclaw agent --agent main --message "1"
+Your next event is Go home at 6:00 PM. Leaving from Coding class (22 Havelock Rd):
+⏳ Wrap up — 4:39 PM   🎒 Get ready — 4:49 PM   🚪 Leave — 5:04 PM
+```
+
+Real travel time from the class, not the degenerate same-point trip from §48 — the whole chain (§47's stale-event fix, §48's same-point fix, and this section's calendar-aware location check) now composes correctly for a scenario that's genuinely common: leaving one place to go to the next, not always starting from home.
+
+---
+
+## 50. Development Principles Learned
 
 ### Test one layer at a time
 
@@ -2325,7 +2456,7 @@ Gmail unavailable
 
 ---
 
-## 47. Approximate Repo Structure
+## 51. Approximate Repo Structure
 
 ```text
 get_mooving/
@@ -2342,7 +2473,8 @@ get_mooving/
 │   ├── trusted_contacts.example.json
 │   ├── profile.json              # local only
 │   ├── watched_threads.json      # local only
-│   └── trusted_contacts.json     # local only
+│   ├── trusted_contacts.json     # local only
+│   └── inbox_watermark.json      # local only
 │
 ├── src/
 │   ├── planner.py
@@ -2356,6 +2488,7 @@ get_mooving/
 │   ├── place_resolver.py
 │   ├── gmail_send.py
 │   ├── gmail_check_replies.py
+│   ├── gmail_check_inbox.py
 │   └── schedule_milestones.py
 │
 ├── skills/
@@ -2372,7 +2505,7 @@ get_mooving/
 
 ---
 
-## 48. Short Development Summary
+## 52. Short Development Summary
 
 The prototype grew in this order:
 

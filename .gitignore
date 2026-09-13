@@ -13,6 +13,7 @@ data/state.json
 data/profile.json
 data/watched_threads.json
 data/trusted_contacts.json
+data/inbox_watermark.json
 
 # Google API credentials
 calendar_credentials.json

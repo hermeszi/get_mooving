@@ -28,12 +28,15 @@ MILESTONES = [
 ]
 
 
-def existing_declaration_keys() -> set:
+def existing_jobs() -> dict:
     """
     openclaw automations add's --declaration-key does NOT dedupe on its
     own (confirmed by testing: re-running with the same key created a
     second job). So idempotency is handled here instead: check what's
-    already scheduled before adding anything.
+    already scheduled before adding anything — keyed by declarationKey,
+    with each job's id and current "at" time, so a stale time (e.g. the
+    origin location changed after the first schedule) can be corrected
+    instead of silently left wrong.
     """
 
     result = subprocess.run(
@@ -45,7 +48,11 @@ def existing_declaration_keys() -> set:
 
     jobs = json.loads(result.stdout).get("jobs", [])
 
-    return {job.get("declarationKey") for job in jobs if job.get("declarationKey")}
+    return {
+        job["declarationKey"]: {"id": job["id"], "at": job.get("schedule", {}).get("at")}
+        for job in jobs
+        if job.get("declarationKey")
+    }
 
 
 def schedule_all() -> dict:
@@ -70,8 +77,9 @@ def schedule_all() -> dict:
         return {"scheduled": [], "reason": "no_notify_email"}
 
     now = datetime.now().astimezone()
-    existing_keys = existing_declaration_keys()
+    existing = existing_jobs()
     scheduled = []
+    rescheduled = []
 
     for field, label in MILESTONES:
         when = plan[field]
@@ -80,8 +88,32 @@ def schedule_all() -> dict:
             continue
 
         key = f"gm-{field}-{event['start']}"
+        existing_job = existing.get(key)
 
-        if key in existing_keys:
+        if existing_job:
+            existing_at = existing_job["at"]
+
+            # Compare as real datetimes, not raw strings — same instant
+            # can be written with a different offset/precision and
+            # still be correct.
+            if existing_at and datetime.fromisoformat(existing_at.replace("Z", "+00:00")) == when:
+                continue
+
+            # A job exists for this milestone but at the wrong time —
+            # e.g. the starting location was corrected after the first
+            # schedule, shifting every computed time. Fix it in place
+            # rather than leaving a stale reminder sitting there.
+            subprocess.run(
+                [
+                    "openclaw", "automations", "edit", existing_job["id"],
+                    "--at", when.isoformat(),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            rescheduled.append({"milestone": field, "label": label, "at": when.isoformat()})
             continue
 
         subject = f"{label} — {event['title']}"
@@ -112,7 +144,7 @@ def schedule_all() -> dict:
 
         scheduled.append({"milestone": field, "label": label, "at": when.isoformat()})
 
-    return {"scheduled": scheduled}
+    return {"scheduled": scheduled, "rescheduled": rescheduled}
 
 
 def main():
@@ -128,11 +160,13 @@ def main():
 
     if args.json:
         print(json.dumps(result))
-    elif not result["scheduled"]:
+    elif not result["scheduled"] and not result.get("rescheduled"):
         print(f"Nothing scheduled ({result.get('reason', 'no future milestones')}).")
     else:
         for item in result["scheduled"]:
             print(f"- {item['label']} at {item['at']}")
+        for item in result.get("rescheduled", []):
+            print(f"- {item['label']} corrected to {item['at']}")
 
 
 if __name__ == "__main__":
