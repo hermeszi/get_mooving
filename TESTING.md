@@ -83,6 +83,8 @@ along with whatever specific path just changed (e.g. temporarily swap `ONEMAP_TO
 | `test_late_recovery.py` | Lateness calculation and result shaping | Pure functions |
 | `test_schedule_milestones.py` | Add / don't duplicate / reschedule-if-stale / ignore-past-milestones | `resolve_plan()` and `subprocess.run()` mocked — no real `openclaw` calls |
 | `test_gmail_safety.py` | A reply is trusted by its real address, never its display name (a spoofed `"trusted@x.com" <attacker@evil.com>` header must resolve to the attacker's address) | Pure function + a temp file standing in for `trusted_contacts.json` |
+| `test_whatsapp_trust.py` | A WhatsApp sender's number classifies correctly as owner/trusted/unknown, survives formatting differences (spaces, dashes), doesn't crash without `owner_whatsapp` configured | Pure function + a temp file standing in for `trusted_contacts.json` |
+| `test_whatsapp_send.py` | The real `openclaw message send` failure shape (confirmed live pre-link: `{"ok": false, "error": {...}}`) and a non-JSON/command-not-found case both turn into the standard `{"error", "message"}` shape, never a crash | `subprocess.run` mocked |
 
 This is deliberately not exhaustive — it covers the pure calculation core, every already-discovered real bug (so none of them can silently come back), and the one security-relevant rule (sender trust). Scripts that are almost entirely I/O plumbing around already-tested pieces (`update_location.py`, `route_compare.py`, `place_resolver.py`) don't have dedicated files yet; add one the same way if a bug is ever found in one.
 

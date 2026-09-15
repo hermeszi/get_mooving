@@ -70,7 +70,7 @@ openclaw agent --agent main --message "what if I leave at 10:30 by taxi?"
 openclaw agent --agent main --message "did anyone reply to my late message?"
 ```
 
-Or in whatever chat surface your OpenClaw is connected to — same skill, same behavior.
+Or in whatever chat surface your OpenClaw is connected to — same skill, same behavior. If you did SETUP.md's optional step 8, that includes WhatsApp: message the agent from your own linked number for full access, same as the terminal. A trusted contact (not you) messaging from WhatsApp gets a deliberately narrower relay-only experience — see `skills/get_mooving/SKILL.md`'s "WhatsApp Channel" section for exactly what that means.
 
 The first time it asks to confirm your location, answer it (or run `.venv/bin/python3 src/update_location.py --confirm` directly) — this checks every 2 hours, and also whenever a calendar event currently in progress suggests you're somewhere other than your last confirmed address.
 
@@ -92,7 +92,7 @@ Every command below uses the **full absolute path** to `.venv/bin/python3` — n
 
 ### Automation 1 — proactive ⏳🎒🚪 reminders
 
-This one is cheap: it runs `schedule_milestones.py` as a plain command, no LLM involved. Python reads your calendar, computes real times, and schedules exact one-shot emails.
+This one is cheap: it runs `schedule_milestones.py` as a plain command, no LLM involved. Python reads your calendar, computes real times, and schedules exact one-shot notifications — email or WhatsApp, per `profile.json`'s `notify_channel` (see SETUP.md step 6 and 8).
 
 ```bash
 openclaw automations add \
@@ -109,7 +109,7 @@ check next Calendar event
    ↓
 calculate travel + buffers
    ↓
-schedule exact one-shot emails:
+schedule exact one-shot notifications:
 ⏳ Wrap up · 🎒 Get ready · 🚪 Leave now
 ```
 
@@ -182,7 +182,7 @@ openclaw gateway stop    # end of day — pauses both, nothing deleted
 
 ## Model and cost
 
-By default this project uses `openrouter/anthropic/claude-sonnet-4.6` — reliable, but not cheap, and every automated email check (if the poller is on) is a real conversation with it.
+This project currently uses `openrouter/deepseek/deepseek-v4.1-flash` — around 25x cheaper than `openrouter/anthropic/claude-sonnet-4.6` (its predecessor here), and re-tested against the exact failure mode below before being adopted (see DEVELOPMENT.md §57).
 
 Check what's currently configured:
 
@@ -194,11 +194,11 @@ openclaw agents list          # shows the model for this specific agent
 List what's available and switch:
 
 ```bash
-openclaw models list
+openclaw models list --all --provider openrouter
 openclaw models set <model-id>
 ```
 
-**Before switching to something cheaper, read DEVELOPMENT.md §29.** A cheaper model (`openrouter/qwen/qwen3-30b-a3b-instruct-2507`) was tried first for exactly this reason, and it turned out to *silently* fail at the one thing this whole project depends on — reliably deciding to actually run the deterministic scripts instead of hallucinating an answer or claiming no tools exist. It's not just slower or lower quality; it can quietly break correctness in a way that's easy to miss. If you do switch to save cost, test with a plain "when should I leave" message afterward and confirm it's actually running `run_planner.sh` (real numbers, not a guess) before trusting it for anything scheduled.
+**Before switching models, read DEVELOPMENT.md §29 and §57.** A cheap model (`openrouter/qwen/qwen3-30b-a3b-instruct-2507`) was tried early on and *silently* failed at the one thing this whole project depends on — reliably deciding to actually run the deterministic scripts instead of hallucinating an answer or claiming no tools exist. It's not just slower or lower quality; it can quietly break correctness in a way that's easy to miss. Whenever you switch models, test with a plain "when should I leave" message afterward, in a **fresh session** (`openclaw agent --agent main --message "/new"`), and confirm it's actually running `run_planner.sh`/`exec` (real numbers, not a guess, and check `openclaw audit` for a real `exec` tool call) before trusting it for anything scheduled. §57 also found real OpenRouter pricing is easiest to check directly (`curl https://openrouter.ai/api/v1/models`, then query the JSON locally) — fetching that URL through a web-summarization tool can silently truncate the ~450-model catalog before reaching the fields you need.
 
 `openclaw gateway usage-cost --all-agents` exists but showed `$0.0000` even with heavy real usage in testing here — this project's spend goes through OpenRouter directly, so **check [openrouter.ai's own activity/usage page](https://openrouter.ai/activity)** for real billing, not OpenClaw's local counter.
 

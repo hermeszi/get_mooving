@@ -26,13 +26,42 @@ MODE_DISPLAY = {
     "drive": ("🚕", "Drive/taxi (road estimate)"),
 }
 
+MODE_FUNCTIONS = {
+    "public_transport": get_public_transport_time,
+    "drive": get_drive_time,
+}
+
 
 def lateness_minutes(meeting_time: datetime, expected_arrival: datetime) -> int:
     return round((expected_arrival - meeting_time).total_seconds() / 60)
 
 
-def build_result(event: dict, meeting_time: datetime, options: list) -> dict:
-    return {
+def compute_options(start_location: dict, destination: dict, now: datetime) -> tuple:
+    """
+    Try every transport mode independently — one mode's OneMap failure
+    (e.g. a routing 404 for a specific real trip) shouldn't discard a
+    working result from another mode, which matters most exactly when
+    this script is used: the user is already late and needs whatever
+    options actually exist right now.
+    """
+
+    options = []
+    unavailable = []
+
+    for mode, get_minutes in MODE_FUNCTIONS.items():
+        try:
+            minutes = get_minutes(start_location, destination, now)
+        except OneMapError as error:
+            unavailable.append({"mode": mode, "error": onemap_error_reason(error), "message": str(error)})
+            continue
+
+        options.append((mode, now + timedelta(minutes=minutes)))
+
+    return options, unavailable
+
+
+def build_result(event: dict, meeting_time: datetime, options: list, unavailable: list) -> dict:
+    result = {
         "event": event["title"],
         "destination": event["location"],
         "meeting_time": format_24h(meeting_time),
@@ -47,8 +76,13 @@ def build_result(event: dict, meeting_time: datetime, options: list) -> dict:
         ],
     }
 
+    if unavailable:
+        result["unavailable_modes"] = unavailable
 
-def print_result(meeting_time: datetime, options: list) -> None:
+    return result
+
+
+def print_result(meeting_time: datetime, options: list, unavailable: list) -> None:
     print()
     print("🚨 Plans changed.")
     print()
@@ -58,6 +92,10 @@ def print_result(meeting_time: datetime, options: list) -> None:
         late = lateness_minutes(meeting_time, arrival)
         status = f"{late} min late" if late > 0 else "on time"
         print(f"{emoji} {label:<17} arrive {format_time(arrival)} ({status})")
+
+    for failure in unavailable:
+        emoji, label = MODE_DISPLAY.get(failure["mode"], ("•", failure["mode"]))
+        print(f"{emoji} {label:<17} unavailable — {failure['message']}")
 
 
 def main():
@@ -123,22 +161,17 @@ def main():
         emit_error(onemap_error_reason(error), str(error))
         return
 
-    try:
-        transit_minutes = get_public_transport_time(start_location, destination, now)
-        drive_minutes = get_drive_time(start_location, destination, now)
-    except OneMapError as error:
-        emit_error(onemap_error_reason(error), str(error))
+    options, unavailable = compute_options(start_location, destination, now)
+
+    if not options:
+        reasons = "; ".join(f"{failure['mode']}: {failure['message']}" for failure in unavailable)
+        emit_error("all_modes_unavailable", f"Could not calculate any travel option: {reasons}")
         return
 
-    options = [
-        ("public_transport", now + timedelta(minutes=transit_minutes)),
-        ("drive", now + timedelta(minutes=drive_minutes)),
-    ]
-
     if args.json:
-        print(json.dumps(build_result(event, meeting_time, options)))
+        print(json.dumps(build_result(event, meeting_time, options, unavailable)))
     else:
-        print_result(meeting_time, options)
+        print_result(meeting_time, options, unavailable)
 
 
 if __name__ == "__main__":

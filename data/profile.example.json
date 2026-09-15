@@ -1,6 +1,8 @@
 {
   "preferred_transport": "public_transport",
   "notify_email": "you@example.com",
+  "notify_channel": "gmail",
+  "owner_whatsapp": "+10000000000",
 
   "buffers": {
     "early_arrival_minutes": 10,

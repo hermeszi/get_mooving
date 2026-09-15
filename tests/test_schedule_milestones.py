@@ -163,3 +163,49 @@ def test_schedule_all_skips_when_no_notify_email(mocker):
 
     assert result == {"scheduled": [], "reason": "no_notify_email"}
     assert calls == []
+
+
+def test_schedule_all_uses_whatsapp_when_configured(mocker):
+    plan = make_plan(30, 45, 60)
+    whatsapp_profile = {"notify_channel": "whatsapp", "owner_whatsapp": "+6591112222"}
+    mocker.patch(
+        "schedule_milestones.resolve_plan",
+        return_value={"ok": True, "event": EVENT, "plan": plan, "profile": whatsapp_profile},
+    )
+    run, calls = mock_subprocess(mocker, existing_jobs=[])
+
+    result = sm.schedule_all()
+
+    assert len(result["scheduled"]) == 3
+    add_calls = [c for c in calls if c[1:3] == ["automations", "add"]]
+    commands = [c[c.index("--command") + 1] for c in add_calls]
+    assert all("whatsapp_send.py" in command for command in commands)
+    assert all("gmail_send.py" not in command for command in commands)
+    assert all('"+6591112222"' in command for command in commands)
+
+
+def test_schedule_all_skips_when_whatsapp_configured_but_no_owner_number(mocker):
+    plan = make_plan(30, 45, 60)
+    whatsapp_profile = {"notify_channel": "whatsapp"}
+    mocker.patch(
+        "schedule_milestones.resolve_plan",
+        return_value={"ok": True, "event": EVENT, "plan": plan, "profile": whatsapp_profile},
+    )
+    run, calls = mock_subprocess(mocker, existing_jobs=[])
+
+    result = sm.schedule_all()
+
+    assert result == {"scheduled": [], "reason": "no_owner_whatsapp"}
+    assert calls == []
+
+
+def test_build_command_gmail_vs_whatsapp():
+    gmail_command = sm._build_command("gmail", "you@example.com", "Subject", "Body text")
+    assert "gmail_send.py" in gmail_command
+    assert '--subject "Subject"' in gmail_command
+    assert '--body "Body text"' in gmail_command
+
+    whatsapp_command = sm._build_command("whatsapp", "+6591112222", "Subject", "Body text")
+    assert "whatsapp_send.py" in whatsapp_command
+    assert '--to "+6591112222"' in whatsapp_command
+    assert "Subject\nBody text" in whatsapp_command

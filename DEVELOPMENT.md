@@ -1058,7 +1058,7 @@ There is currently no way to feed a user-supplied destination back into `planner
 - [x] OpenClaw installed on Linux
 - [x] Gateway configured and running
 - [x] OpenRouter API key
-- [x] fixed Qwen model (superseded — see §29, Step 5: swapped to `openrouter/anthropic/claude-sonnet-4.6` after Qwen3 30B proved unreliable at skill/tool dispatch)
+- [x] fixed Qwen model (superseded — see §29, Step 5: swapped to `openrouter/anthropic/claude-sonnet-4.6` after Qwen3 30B proved unreliable at skill/tool dispatch; superseded again — see §57: swapped to `openrouter/deepseek/deepseek-v4.1-flash`, ~25x cheaper, re-tested against §29's exact failure mode and confirmed reliable)
 - [x] Python virtual environment
 - [x] deterministic `planner.py`
 - [x] mock Calendar data
@@ -1109,12 +1109,13 @@ There is currently no way to feed a user-supplied destination back into `planner
 - [x] every OneMap failure (missing token, HTTP error, network error, and the search endpoint's 200-with-error-body case) now surfaces as a structured `OneMapError`, and every script that calls OneMap catches it and prints clean `{"error", "message"}` JSON instead of a raw traceback (§52, `onemap.py` + all 5 callers)
 - [x] a real `pytest` unit test suite — 46 tests across 7 files, covering the deterministic core and every previously-found real bug as a regression test, run with everything external mocked (§53, `tests/`)
 - [x] testing formally split into three levels (unit / integration smoke / user flow), documented in `TESTING.md`, with CI running Level 1 only (§53, `.github/workflows/tests.yml`)
+- [x] WhatsApp channel — linked, gated by `channels.whatsapp.allowFrom`, trust tiers built and unit-tested, sender-identity mechanism confirmed live, and a full end-to-end exchange (location confirmation → Main Plan → real answer) observed working over a real WhatsApp conversation (§54–§56)
+- [x] `refresh_onemap_token.py` — fetches a fresh `ONEMAP_TOKEN` from OneMap's real auth endpoint and writes it into `.env` in place, closing the "Please implement automatic renewal" ask in `onemap.py`'s own error messages; verified live against the real endpoint (§56)
 
 ### Still being developed
 
 - [ ] a recurring automation for either email check (`gmail_check_replies.py`/`gmail_check_inbox.py`) — milestone scheduling is live, email-checking isn't yet (on-demand only)
 - [ ] Docker / cloud deployment
-- [ ] WhatsApp as a real OpenClaw channel — would give genuine push for that channel; still just an idea, per the original roadmap
 - [ ] Gmail inbox as an *open* command channel (any sender, not just the allowlist) — §48 closed the trusted-sender case; a fully open inbox still needs its own safety/threat-model design before building
 
 ### Optional, blocked on external access
@@ -2441,7 +2442,7 @@ Split, moving content rather than rewriting it (so nothing already-verified got 
 - **`SETUP.md`** — file structure through installing the skill (previously README §s 1–7). Ends with a forward pointer to OPERATING.md.
 - **`OPERATING.md`** — OpenClaw basics, daily routine, using it, both automations, model/cost. Ends with pointers back to README (privacy) and DEVELOPMENT.md (why).
 
-`DEVELOPMENT.md`'s own "Approximate Repo Structure" snapshot (§55) updated to list the three files — a current-state reference, unlike the surrounding historical sections which correctly stayed untouched (they describe README as it was *at the time each entry was written*, not as it is now).
+`DEVELOPMENT.md`'s own "Approximate Repo Structure" snapshot (§59) updated to list the three files — a current-state reference, unlike the surrounding historical sections which correctly stayed untouched (they describe README as it was *at the time each entry was written*, not as it is now).
 
 ---
 
@@ -2508,7 +2509,96 @@ Documented in a new **`TESTING.md`**, including a short vocabulary section (unit
 
 ---
 
-## 54. Development Principles Learned
+## 54. WhatsApp as a Second Channel, and an Honest Gap in What Could Be Verified
+
+The original roadmap listed WhatsApp as "would give genuine push for that channel; still just an idea" (§27's "Still being developed"). Picked up on a new branch (`feature/whatsapp-channel`), with the user's own architecture sketch as the starting point: WhatsApp message → OpenClaw Gateway → agent → Get Mooving skill → reply back, event-driven, no polling — and three trust tiers: the owner's own number gets full access, a trusted friend's number can trigger the agent but must never see the calendar, and an unknown number is rejected.
+
+**First, checked what OpenClaw actually supports before building anything on top of it** — the project's own architecture principle ("Python calculates, LLM communicates") extends to not inventing integration behavior either. `openclaw channels list --all` showed WhatsApp as a real, supported-but-not-installed plugin (`@openclaw/whatsapp`, via `openclaw channels add --channel whatsapp`), and `openclaw config schema` confirmed real, existing config paths — `channels.whatsapp.dmPolicy` and `channels.whatsapp.allowFrom` — that gate who can even reach the agent, before any of this project's own code runs at all. `openclaw message send --channel whatsapp --target <e.164> --message <text> --json` is the outbound primitive, confirmed live (even pre-install, it returns a real, consistent `{"ok": false, "error": {"type", "message"}}` shape) to be the right thing for `whatsapp_send.py` to wrap.
+
+**Two things asked of the user directly, rather than guessed**: which npm/ClawHub source to install the plugin from (linking WhatsApp needs a real QR-code scan on the user's own phone — genuinely not something that can be driven from a non-interactive shell; `openclaw channels add --channel whatsapp` itself refused with "Interactive channel setup requires a TTY" when tried), and what a trusted-non-owner contact should actually be allowed to do. Chose **relay-only**: they can ask the agent to pass a message to the owner, but get zero calendar/location/travel information back — the same one-way boundary `SKILL.md` already enforces for trusted email contacts (§48), just extended to a new channel rather than invented fresh.
+
+**Built, mirroring existing patterns rather than introducing new ones:**
+
+- `whatsapp_trust.py` — classifies a sender's E.164 number into `"owner"` / `"trusted"` / `"unknown"`, phone-number equivalent of `gmail_check_inbox.py`'s `is_owner` check. Reads `profile.json`'s new `owner_whatsapp` and `trusted_contacts.json`'s existing-but-previously-unused `phones` field (deliberately reserved for exactly this back in §43). Normalizes formatting differences (spaces/dashes/parens) before comparing, same spirit as postal-code comparison in `location_state.py` (§49).
+- `whatsapp_send.py` — the WhatsApp equivalent of `gmail_send.py`: wraps `openclaw message send`, turns its JSON (success or the real `{"ok": false, ...}` failure shape confirmed above) into this project's standard `{"status": "sent", ...}` / `{"error": "send_failed", "message": ...}` contract. Used only for proactive/out-of-band sends — never to "reply" within a live WhatsApp turn, since OpenClaw already delivers the agent's own response back over whichever channel a message arrived on; SKILL.md is explicit about that distinction so the agent doesn't double-send.
+- `schedule_milestones.py` gained `notify_channel` (`"gmail"`|`"whatsapp"`, in `profile.json`) so the same one milestone-scheduling mechanism (§44) can notify either way — `_notify_target()`/`_build_command()` pick the target and the send command, and the existing dedupe/reschedule/past-ignored logic (all still covered by tests, §53) didn't need to change at all.
+- `SKILL.md` gained a "WhatsApp Channel" section: classify the sender first, always via the script, never by eyeballing a number in chat (same rule as never trusting an email's display name, §43); `"owner"` → full access, reply lives in the conversation itself; `"trusted"` → relay-only, acknowledge and notify the owner out-of-band via whichever `notify_channel` is configured; `"unknown"` → refuse outright, treated as a backstop since `allowFrom` should already have stopped it at the gateway.
+- `SETUP.md` gained an optional step 8 — the QR-link step handed to the user's own terminal, plus the exact `openclaw config set channels.whatsapp.dmPolicy/allowFrom` commands (real paths, confirmed against the schema, not guessed).
+
+**The one thing this section is deliberately not claiming to have verified**: whether OpenClaw reliably exposes the real sender's phone number to the agent/model for a WhatsApp turn — as opposed to, say, only being visible in some form the model can't cleanly relay into a shell argument. The WhatsApp channel docs describe an inbound "shared envelope" that includes the phone number, but nothing in the docs (checked specifically, including the "Context" and "Channel routing" pages) confirms the exact mechanism by which that reaches a skill's instructions, and it couldn't be tested directly — the plugin isn't linked to a real account yet. Rather than write `SKILL.md` as if this were settled, it says explicitly: if the sender's number isn't clearly available in a turn's context, don't guess one, say so, and stop — and `SETUP.md` step 8 ends with an explicit instruction to verify this live (send a test message from the owner's own number, then from a trusted contact's) before relying on it, framed as exactly the kind of thing Level 2 smoke testing (§53) exists for.
+
+**Tests**: `test_whatsapp_trust.py` (owner/trusted/unknown, phone-formatting normalization, missing-owner-config doesn't crash) and `test_whatsapp_send.py` (the real confirmed failure shape, plus a non-JSON/command-not-found case that must not crash) — both fully mocked, same Level 1 rules as the rest of the suite. `test_schedule_milestones.py` extended with the WhatsApp branch of `_notify_target()`/`_build_command()`. 62 tests total, all passing.
+
+---
+
+## 55. WhatsApp Linked Live, and the §54 Uncertainty Actually Resolved
+
+The user linked the WhatsApp plugin themselves (own terminal, own phone, QR scan — exactly as §54 said it had to be), set `dmPolicy: "pairing"` with `allowFrom: ["6594898515"]` (their own number), and reported back. Before testing anything, found the skill installed on the running gateway was stale — every `SKILL.md` edit from §54 (the whole "WhatsApp Channel" section) had been written to the repo but never pushed live via `openclaw skills install ... --force && openclaw gateway restart`. Fixed first; confirmed with a diff against the installed copy before treating any live test as meaningful — testing against a stale skill would have proven nothing.
+
+Also set `owner_whatsapp` in the real (gitignored) `data/profile.json` — `whatsapp_trust.py --phone "+6594898515" --json` correctly returned `{"tier": "owner"}` against it, a direct real-data sanity check before any live message was involved.
+
+**The user then sent a real WhatsApp message** ("What's my next meeting?") to the linked number. It came back with "API rate limit reached" — but `openclaw channels logs --channel whatsapp` plus the full gateway log told the real story, and it wasn't a rate limit: OpenRouter returned a `402` billing error ("This request requires more credits... adjust the key's total limit"). The friendly-sounding reply text didn't match the actual cause — a reminder to check the real log before taking an error message's own wording at face value, same instinct as not trusting a display name over a real header (§43). Nothing about this is a Get Mooving bug; it's the user's OpenRouter balance, unrelated to anything in this repo.
+
+**But the failed run still answered §54's open question**, because the failure happened *after* the message was logged but the model call itself never got far enough to matter for what we needed to see. The gateway log's `web-auto-reply`/`processMessage` entry showed the exact text that becomes the turn's content:
+
+```text
+[WhatsApp +6594898515 +2d Wed 2026-09-16 00:12:22 GMT+8] +6594898515: What's my next meeting?
+```
+
+The sender's number is prepended as plain text, before the message body, by the gateway itself — not something the model has to infer or that lives only in structured metadata a skill's instructions can't reach. This confirms the mechanism §54 explicitly declined to assume. Updated `SKILL.md`'s "WhatsApp Channel" section to name the exact prefix format instead of the vaguer "as shown in this turn's context," and updated `SETUP.md` step 8 to state this as confirmed rather than something the user still needs to verify themselves.
+
+**Still open**: a full end-to-end reply (tier classification → "Main Plan" → an actual answer back over WhatsApp) hasn't been seen yet — it needs the OpenRouter balance topped up first. The message-format question this section set out to answer is resolved either way; the remaining test is just "does the rest of the skill behave correctly," not "can it see who's texting."
+
+---
+
+## 56. OneMap Token Automation, and the Full WhatsApp Flow Confirmed End to End
+
+Two blockers closed the same session. First, the user asked whether the project should have its own script for refreshing `ONEMAP_TOKEN` instead of doing it by hand every ~3 days, pasting a draft with a guessed auth URL and hardcoded credentials. Checked OneMap's real endpoint before writing anything (web search across the OneMap API client ecosystem, cross-checked against a second independent source) rather than trusting the draft's URL, which turned out to be wrong — `https://www.onemap.gov.sg/api/auth/post/getToken`, not the bare homepage the draft POSTed to; the draft's guessed `access_token`/`expiry_timestamp` response field names were actually correct.
+
+Built `refresh_onemap_token.py`: reads `ONEMAP_EMAIL`/`ONEMAP_PASSWORD` from `.env` (never hardcoded in the script, matching how `ONEMAP_TOKEN` itself is already handled), POSTs to the real endpoint, and rewrites just the `ONEMAP_TOKEN=` line of `.env` in place — every other line (including the credentials themselves) preserved untouched. Same `{"status"|"error", "message"}` contract as every other script; 7 new tests, `requests.post` mocked and `.env` redirected to a `tmp_path` file so a test run never touches the real one. The user ran it themselves (I never saw the password — the script only reads it internally); the resulting token decoded to a fresh 3-day expiry, and a live `place_resolver.py` call confirmed real OneMap results instead of `onemap_auth_failed`.
+
+With that and the OpenRouter balance topped up (the actual cause of §55's "API rate limit reached" message — it was a billing error, not a rate limit), the user re-sent a live WhatsApp test and got a **complete, correct end-to-end exchange**:
+
+```text
+Mingde: What's my next meeting?
+Crab Hermes: 📍 Still starting from Code ninja?
+1. Yes  2. Home  3. Somewhere else
+Mingde: 2
+Crab Hermes: Your next meeting is Godot Workshop at 7:00 PM tonight at SUTD Library.
+⏳ Wrap up 4:29 PM · 🎒 Get ready 4:39 PM · 🚪 Leave 4:54 PM · 🚇 Depart 5:02 PM
+Aiming to arrive by 6:50 PM via public transport. Event runs until 9:30 PM.
+```
+
+This is exactly "Main Plan" and "Location Confirmation" behaving correctly over a channel that didn't exist for this project a day earlier — the stale-location prompt fired (freshness check working), the numbered "2" reply correctly ran `update_location.py` (confirmed by `profile.json`'s `location` changing to "Home" mid-conversation, timestamped between the two messages), and the final reply carries real computed times matching `calculate_plan()`'s contract exactly, not anything invented. `openclaw audit`'s tool-call log is metadata-only (command text redacted), so the exact moment `whatsapp_trust.py` ran isn't independently provable from logs alone — but the result is precisely what correct `"owner"` tier behavior looks like, and nothing in the exchange resembles the relay-only restriction that would apply to a non-owner sender. §54's WhatsApp channel is no longer just unit-tested; it's been exercised for real, successfully, start to finish.
+
+---
+
+## 57. A Cheaper Model, Re-Tested Against §29's Exact Failure Mode — and a Real Bug It Surfaced
+
+Asked to switch to a cheaper model, "even a China model is ok." §29 already had a documented answer worth checking before touching anything: Qwen3 30B was tried early on and broke skill dispatch outright — it hallucinated calling a tool literally named `get-mooving` instead of using `exec`, retried ~10 times, then gave up. Claude Sonnet 4.6 (the model in use ever since) fixed it. So "switch to something cheap" needed the same live test §29 used, not just a config change.
+
+Pulled real OpenRouter pricing (`openrouter.ai/api/v1/models`, downloaded and queried locally — WebFetch's own summarization truncated a 446-model, 738KB payload before it reached the cost fields, so this needed a direct fetch) rather than guessing. Current model: $3/$15 per million tokens (prompt/completion) — and the earlier §55 "billing error" makes more sense in that light, given a single turn was observed requesting up to 128K tokens. Cheapest options with any real reputation for tool-calling reliability, avoiding Qwen3 specifically since it's already proven to fail here: DeepSeek V4 Flash ($0.06/$0.12, ~125x cheaper), GLM 5.3 Flash (Z.ai, ~60x cheaper), DeepSeek V4.1 Flash ($0.15/$0.60, ~25x cheaper), MiniMax M2, GLM 4.6, Kimi K2 (Moonshot).
+
+Chose DeepSeek V4.1 Flash to test first — priced between the very cheapest flash-tier options and the pricier agentic-reputation models, on the theory that the ultra-cheap flash tier carries the same small-model tool-selection risk Qwen3 30B did. Switched with `openclaw models set openrouter/deepseek/deepseek-v4.1-flash`, confirmed via `openclaw agents list`, then re-ran §29's exact test: fresh session (`/new`), plain natural-language message, no special phrasing.
+
+```text
+Qwen3 30B (§29):        hallucinated "get-mooving" tool call, retried, gave up
+DeepSeek V4.1 Flash:    plain request → skill → exec → live planner → succeeded
+```
+
+Confirmed via `openclaw audit` (real `exec` tool calls, run succeeded) and the gateway log (`model=deepseek/deepseek-v4.1-flash` throughout) — not just eyeballing the reply text. A second test with a different trigger ("I'm running late") surfaced a real OneMap 404 for the live start/destination pair — and the model correctly relayed the real error instead of inventing lateness numbers, which is itself a good sign for how it follows `SKILL.md`'s "never invent a value" rule under a failure condition, not just the happy path.
+
+**That 404 turned out to be a real, unrelated bug**, not a model or OneMap flakiness issue — reproduced directly with `late_recovery.py --json`. `get_public_transport_time()` and `get_drive_time()` were wrapped in one shared `try/except` (`git blame` traces this back to the original §34 implementation, unchanged since): a manual isolation test showed the transit call genuinely 404s for this trip while the drive call succeeds cleanly (44 min) — so the whole response was being discarded over a single mode's failure, exactly when "I'm running late, what are my options" is the one moment losing *all* options matters most.
+
+Fixed by trying each mode independently (`compute_options()`, replacing the two hardcoded calls): options that succeed are kept, a mode that fails is recorded in a new `unavailable_modes` field (`{"mode", "error", "message"}`) instead of aborting everything, and the response only becomes a hard error (`"all_modes_unavailable"`) if every mode fails. `SKILL.md`'s "Late Recovery" section updated to relay `unavailable_modes` briefly rather than treating a partial result as a failure. 6 new/updated tests (`compute_options` with one mode failing, both succeeding, both failing); live-reproduced against the real 404 before and after — before: total failure; after: `{"options": [{"mode": "drive", ...}], "unavailable_modes": [{"mode": "public_transport", "error": "onemap_unavailable", ...}]}`.
+
+**A genuine limitation surfaced during re-testing, worth naming honestly**: a third live re-test (after the fix and a skill reinstall) got refused by the agent — it correctly noticed the message lacked WhatsApp's `[WhatsApp +<number> ...]` prefix and stopped per §55's own safety rule, rather than guessing. Root cause: `openclaw agent --agent main --message ...` (the CLI test path used throughout this project) shares the exact same session (`agent:main:main`) as the real WhatsApp conversation — so a `/new` reset the visible conversation but not whatever the memory subsystem could still recall from the earlier real exchange, and the model reasonably inferred "this might still be WhatsApp" from that residual context. Not a defect — if anything, evidence the WhatsApp safety net works even under session bleed — but it means CLI-based dispatch testing and real WhatsApp usage are no longer cleanly isolated from each other now that both channels are live on the same default session. Worth a dedicated test session/agent if this needs re-testing via CLI again, rather than the shared `main` session.
+
+Test suite: 73 passing.
+
+---
+
+## 58. Development Principles Learned
 
 ### Test one layer at a time
 
@@ -2569,7 +2659,7 @@ Gmail unavailable
 
 ---
 
-## 55. Approximate Repo Structure
+## 59. Approximate Repo Structure
 
 ```text
 get_mooving/
@@ -2597,7 +2687,10 @@ get_mooving/
 │   ├── test_calendar_google.py
 │   ├── test_late_recovery.py
 │   ├── test_schedule_milestones.py
-│   └── test_gmail_safety.py
+│   ├── test_gmail_safety.py
+│   ├── test_whatsapp_trust.py
+│   ├── test_whatsapp_send.py
+│   └── test_refresh_onemap_token.py
 │
 ├── data/
 │   ├── mock_calendar.json
@@ -2612,6 +2705,7 @@ get_mooving/
 │   ├── planner.py
 │   ├── calendar_google.py
 │   ├── onemap.py
+│   ├── refresh_onemap_token.py    (§56)
 │   ├── location_state.py
 │   ├── update_location.py
 │   ├── late_recovery.py
@@ -2621,7 +2715,9 @@ get_mooving/
 │   ├── gmail_send.py
 │   ├── gmail_check_replies.py
 │   ├── gmail_check_inbox.py
-│   └── schedule_milestones.py
+│   ├── schedule_milestones.py
+│   ├── whatsapp_trust.py          (§54)
+│   └── whatsapp_send.py           (§54)
 │
 ├── skills/
 │   └── get_mooving/
@@ -2637,7 +2733,7 @@ get_mooving/
 
 ---
 
-## 56. Short Development Summary
+## 60. Short Development Summary
 
 The prototype grew in this order:
 

@@ -1,13 +1,14 @@
 """
 Proactive reminders: computes the next event's wrap-up/get-ready/
 leave-now times and schedules a one-shot OpenClaw automation for each
-one still in the future, which emails the user (via gmail_send.py)
-exactly when it fires. Deliberately a command payload, not an agent
-prompt — the content is fully known in advance, so there's no judgment
-call left for a model to make. Safe to run repeatedly: checks what's
-already scheduled first (openclaw automations add's --declaration-key
-does NOT dedupe on its own — confirmed by testing) and only adds
-what's missing.
+one still in the future, which notifies the user (via gmail_send.py or
+whatsapp_send.py, per profile.json's notify_channel) exactly when it
+fires. Deliberately a command payload, not an agent prompt — the
+content is fully known in advance, so there's no judgment call left
+for a model to make. Safe to run repeatedly: checks what's already
+scheduled first (openclaw automations add's --declaration-key does NOT
+dedupe on its own — confirmed by testing) and only adds what's
+missing.
 """
 
 import argparse
@@ -20,6 +21,7 @@ from planner import resolve_plan, format_time, BASE_DIR
 
 VENV_PYTHON = BASE_DIR / ".venv" / "bin" / "python3"
 GMAIL_SEND = BASE_DIR / "src" / "gmail_send.py"
+WHATSAPP_SEND = BASE_DIR / "src" / "whatsapp_send.py"
 
 MILESTONES = [
     ("wrap_up_prompt", "⏳ Wrap this up"),
@@ -55,6 +57,32 @@ def existing_jobs() -> dict:
     }
 
 
+def _notify_target(profile: dict):
+    """
+    Which channel/address to notify on, per profile.json's
+    notify_channel (defaults to "gmail" for existing profiles that
+    predate WhatsApp support). Returns (channel, target) or
+    (None, reason) if the chosen channel isn't configured.
+    """
+
+    channel = profile.get("notify_channel", "gmail")
+
+    if channel == "whatsapp":
+        target = profile.get("owner_whatsapp")
+        return (channel, target) if target else (None, "no_owner_whatsapp")
+
+    target = profile.get("notify_email")
+    return (channel, target) if target else (None, "no_notify_email")
+
+
+def _build_command(channel: str, target: str, subject: str, body: str) -> str:
+    if channel == "whatsapp":
+        message = f"{subject}\n{body}"
+        return f'{VENV_PYTHON} {WHATSAPP_SEND} --to "{target}" --message "{message}"'
+
+    return f'{VENV_PYTHON} {GMAIL_SEND} --to "{target}" --subject "{subject}" --body "{body}"'
+
+
 def schedule_all() -> dict:
     """
     Ensure a one-shot reminder is scheduled for every milestone of the
@@ -71,10 +99,10 @@ def schedule_all() -> dict:
     plan = result["plan"]
     profile = result["profile"]
 
-    notify_email = profile.get("notify_email")
+    channel, target = _notify_target(profile)
 
-    if not notify_email:
-        return {"scheduled": [], "reason": "no_notify_email"}
+    if not channel:
+        return {"scheduled": [], "reason": target}
 
     now = datetime.now().astimezone()
     existing = existing_jobs()
@@ -122,10 +150,7 @@ def schedule_all() -> dict:
             f"Meeting at {format_time(plan['meeting_time'])}."
         )
 
-        command = (
-            f'{VENV_PYTHON} {GMAIL_SEND} '
-            f'--to "{notify_email}" --subject "{subject}" --body "{body}"'
-        )
+        command = _build_command(channel, target, subject, body)
 
         subprocess.run(
             [
