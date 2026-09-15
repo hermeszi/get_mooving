@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from calendar_google import get_next_event, get_current_event
-from onemap import search_location, get_public_transport_time
+from onemap import search_location, get_public_transport_time, OneMapError, onemap_error_reason
 from location_state import needs_confirmation, location_confirmation_prompt
 
 
@@ -114,6 +114,10 @@ def print_plan(plan: dict, event: dict) -> None:
     )
 
 
+def _onemap_error_result(error: OneMapError) -> dict:
+    return {"ok": False, "error": onemap_error_reason(error), "message": str(error)}
+
+
 def resolve_plan(destination_override: str = None) -> dict:
     """
     Compute the full plan for the next calendar event. Shared by
@@ -163,38 +167,45 @@ def resolve_plan(destination_override: str = None) -> dict:
         start_location = search_location(location["address"])
     except ValueError as error:
         return {"ok": False, "error": "start_location_not_found", "message": str(error)}
+    except OneMapError as error:
+        return _onemap_error_result(error)
 
     try:
         destination = search_location(event["location"])
     except ValueError as error:
         return {"ok": False, "error": "destination_not_found", "message": str(error)}
+    except OneMapError as error:
+        return _onemap_error_result(error)
 
     #do one rough estimate
     rough_departure = meeting_time - timedelta(
         minutes=buffers["early_arrival_minutes"] + 60)
 
-    travel_minutes = get_public_transport_time(
-        start_location,
-        destination,
-        rough_departure,
-    )
-
-    #first plan
-    plan = calculate_plan(
-        meeting_time=meeting_time,
-        travel_minutes=travel_minutes,
-        early_arrival_minutes=buffers["early_arrival_minutes"],
-        invisible_delay_minutes=buffers["invisible_delay_minutes"],
-        prep_minutes=buffers["prep_minutes"],
-        task_switch_minutes=buffers["task_switch_minutes"],
+    try:
+        travel_minutes = get_public_transport_time(
+            start_location,
+            destination,
+            rough_departure,
         )
 
-    #again with the actual departure time
-    travel_minutes = get_public_transport_time(
-        start_location,
-        destination,
-        plan["physical_departure"],
-    )
+        #first plan
+        plan = calculate_plan(
+            meeting_time=meeting_time,
+            travel_minutes=travel_minutes,
+            early_arrival_minutes=buffers["early_arrival_minutes"],
+            invisible_delay_minutes=buffers["invisible_delay_minutes"],
+            prep_minutes=buffers["prep_minutes"],
+            task_switch_minutes=buffers["task_switch_minutes"],
+            )
+
+        #again with the actual departure time
+        travel_minutes = get_public_transport_time(
+            start_location,
+            destination,
+            plan["physical_departure"],
+        )
+    except OneMapError as error:
+        return _onemap_error_result(error)
 
     plan = calculate_plan(
         meeting_time=meeting_time,

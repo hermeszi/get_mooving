@@ -19,6 +19,8 @@ from onemap import (
     get_walk_time,
     get_cycle_time,
     straight_line_km,
+    OneMapError,
+    onemap_error_reason,
 )
 from location_state import needs_confirmation, location_confirmation_prompt
 from planner import load_json, format_24h
@@ -165,6 +167,9 @@ def main():
         except ValueError as error:
             emit_error("start_location_not_found", str(error))
             return
+        except OneMapError as error:
+            emit_error(onemap_error_reason(error), str(error))
+            return
     else:
         location = profile["location"]
         current_event = get_current_event()
@@ -182,6 +187,9 @@ def main():
         except ValueError as error:
             emit_error("start_location_not_found", str(error))
             return
+        except OneMapError as error:
+            emit_error(onemap_error_reason(error), str(error))
+            return
 
     meeting_time = None
     arrival_target = None
@@ -191,6 +199,9 @@ def main():
             destination = search_location(args.destination)
         except ValueError as error:
             emit_error("destination_not_found", str(error))
+            return
+        except OneMapError as error:
+            emit_error(onemap_error_reason(error), str(error))
             return
     else:
         event = get_next_event()
@@ -217,6 +228,9 @@ def main():
             destination = search_location(event["location"])
         except ValueError as error:
             emit_error("destination_not_found", str(error))
+            return
+        except OneMapError as error:
+            emit_error(onemap_error_reason(error), str(error))
             return
 
     now_local = datetime.now().astimezone()
@@ -246,9 +260,13 @@ def main():
 
     options = {}
 
-    for mode in modes:
-        travel_minutes = MODE_FUNCTIONS[mode](start_location, destination, departure_time)
-        options[mode] = (travel_minutes, departure_time + timedelta(minutes=travel_minutes))
+    try:
+        for mode in modes:
+            travel_minutes = MODE_FUNCTIONS[mode](start_location, destination, departure_time)
+            options[mode] = (travel_minutes, departure_time + timedelta(minutes=travel_minutes))
+    except OneMapError as error:
+        emit_error(onemap_error_reason(error), str(error))
+        return
 
     result = build_result(
         departure_time, meeting_time, arrival_target, options, distance_km, weather

@@ -16,6 +16,7 @@ from email.utils import parseaddr
 from googleapiclient.discovery import build
 
 from gmail_send import get_credentials, DATA_DIR, WATCHED_THREADS_FILE
+from planner import load_json
 
 
 TRUSTED_CONTACTS_FILE = DATA_DIR / "trusted_contacts.json"
@@ -75,7 +76,11 @@ def check_replies() -> list:
     service = build("gmail", "v1", credentials=creds)
 
     my_email = service.users().getProfile(userId="me").execute()["emailAddress"].lower()
-    trusted_emails = load_trusted_emails() | {my_email}
+    owner_email = (load_json("profile.json").get("notify_email") or "").lower()
+    # profile.json explicitly names owner_email as the owner — trust it
+    # automatically, same as the connected account itself, rather than
+    # requiring it to also be duplicated into trusted_contacts.json.
+    trusted_emails = load_trusted_emails() | {my_email, owner_email}
 
     watched = load_watched_threads()
     still_watching = []

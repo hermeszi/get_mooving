@@ -3,7 +3,15 @@ Thin client for Singapore's OneMap API: geocoding/POI search
 (search_location, search_places) and travel-time routing across
 public transport, drive, walk, and cycle. Needs ONEMAP_TOKEN in .env —
 OneMap tokens expire roughly every 3 days and must be refreshed
-manually (see README).
+manually (see SETUP.md).
+
+Every network call goes through _get(), which turns a missing token,
+an auth failure, or any other OneMap/network error into one of the
+two exceptions below — never a bare requests exception or RuntimeError
+leaking out. Every caller is expected to catch OneMapError (or its two
+subclasses) alongside the existing "not found" ValueError, so a
+script's --json output stays a clean {"error", "message"} object no
+matter what actually went wrong.
 """
 
 import os
@@ -23,13 +31,87 @@ SEARCH_URL = "https://www.onemap.gov.sg/api/common/elastic/search"
 ROUTE_URL = "https://www.onemap.gov.sg/api/public/routingsvc/route"
 
 
+class OneMapError(Exception):
+    """Any OneMap failure that isn't a plain 'location not found'."""
+
+
+class OneMapAuthError(OneMapError):
+    """Missing, invalid, or expired ONEMAP_TOKEN."""
+
+
+class OneMapUnavailableError(OneMapError):
+    """Network/timeout/server-side failure — not an auth problem."""
+
+
+def onemap_error_reason(error: OneMapError) -> str:
+    """
+    Machine-readable error code for a caught OneMapError, for a
+    script's --json "error" field. Shared so every caller classifies
+    the same way instead of re-implementing the isinstance check.
+    """
+    return "onemap_auth_failed" if isinstance(error, OneMapAuthError) else "onemap_unavailable"
+
+
 def get_headers():
     if not ONEMAP_TOKEN:
-        raise RuntimeError("ONEMAP_TOKEN is missing from .env")
+        raise OneMapAuthError("ONEMAP_TOKEN is missing from .env")
 
     return {
         "Authorization": ONEMAP_TOKEN
     }
+
+
+def _get(url: str, params: dict, timeout: int) -> dict:
+    """
+    Shared request path for both OneMap endpoints. Converts a missing
+    token, an HTTP auth error, any other HTTP error, or a network
+    failure into OneMapAuthError/OneMapUnavailableError, so nothing
+    above this function ever sees a raw requests exception.
+    """
+
+    try:
+        response = requests.get(
+            url,
+            headers=get_headers(),
+            params=params,
+            timeout=timeout,
+        )
+
+        response.raise_for_status()
+
+    except OneMapError:
+        raise
+
+    except requests.exceptions.HTTPError as error:
+        status = error.response.status_code if error.response is not None else None
+
+        if status in (401, 403):
+            raise OneMapAuthError(
+                f"OneMap authentication failed (HTTP {status}). "
+                "Refresh ONEMAP_TOKEN — it expires roughly every 3 days."
+            ) from error
+
+        raise OneMapUnavailableError(f"OneMap returned HTTP {status}.") from error
+
+    except requests.exceptions.RequestException as error:
+        raise OneMapUnavailableError(f"Could not reach OneMap: {error}") from error
+
+    return response.json()
+
+
+# OneMap's search endpoint returns HTTP 200 with the error described in
+# the JSON body for an expired/invalid token — confirmed live, it does
+# not raise a 401 the way the routing endpoint does. Classify these by
+# message content so both endpoints surface the same OneMapAuthError.
+_AUTH_ERROR_KEYWORDS = ("token", "auth", "unauthorized", "unauthorised")
+
+
+def _raise_for_data_error(message: str):
+    if any(keyword in message.lower() for keyword in _AUTH_ERROR_KEYWORDS):
+        raise OneMapAuthError(f"OneMap authentication failed: {message}")
+
+    raise OneMapUnavailableError(message)
+
 
 def search_location(query: str) -> dict:
     """
@@ -59,19 +141,10 @@ def search_location(query: str) -> dict:
             "pageNum": 1,
         }
 
-        response = requests.get(
-            SEARCH_URL,
-            headers=get_headers(),
-            params=params,
-            timeout=10,
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
+        data = _get(SEARCH_URL, params, timeout=10)
 
         if data.get("error"):
-            raise RuntimeError(data["error"])
+            _raise_for_data_error(data["error"])
 
         results = data.get("results", [])
 
@@ -111,19 +184,10 @@ def search_places(query: str, near: dict, limit: int = 3) -> list:
             "pageNum": page,
         }
 
-        response = requests.get(
-            SEARCH_URL,
-            headers=get_headers(),
-            params=params,
-            timeout=10,
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
+        data = _get(SEARCH_URL, params, timeout=10)
 
         if data.get("error"):
-            raise RuntimeError(data["error"])
+            _raise_for_data_error(data["error"])
 
         results.extend(data.get("results", []))
         total_pages = data.get("totalNumPages", 1)
@@ -150,57 +214,9 @@ def search_places(query: str, near: dict, limit: int = 3) -> list:
 
     return candidates[:limit]
 
-# def search_location(query: str) -> dict:
-#     """
-#     Convert an address/building name/postal code into coordinates.
-#     """
-
-#     params = {
-#         "searchVal": query,
-#         "returnGeom": "Y",
-#         "getAddrDetails": "Y",
-#         "pageNum": 1,
-#     }
-
-#     response = requests.get(
-#         SEARCH_URL,
-#         headers=get_headers(),
-#         params=params,
-#         timeout=10,
-#     )
-
-#     response.raise_for_status()
-
-#     data = response.json()
-
-#     if data.get("error"):
-#         raise RuntimeError(data["error"])
-
-#     results = data.get("results", [])
-
-#     if not results:
-#         raise ValueError(f"Location not found: {query}")
-
-#     result = results[0]
-
-#     return {
-#         "address": result["ADDRESS"],
-#         "latitude": float(result["LATITUDE"]),
-#         "longitude": float(result["LONGITUDE"]),
-#     }
-
 
 def _request_route(params: dict) -> dict:
-    response = requests.get(
-        ROUTE_URL,
-        headers=get_headers(),
-        params=params,
-        timeout=15,
-    )
-
-    response.raise_for_status()
-
-    return response.json()
+    return _get(ROUTE_URL, params, timeout=15)
 
 
 def _extract_minutes(data: dict) -> int:
@@ -217,7 +233,7 @@ def _extract_minutes(data: dict) -> int:
     if route_summary and "total_time" in route_summary:
         return math.ceil(route_summary["total_time"] / 60)
 
-    raise RuntimeError(
+    raise OneMapUnavailableError(
         f"Could not find journey duration in OneMap response: {data}"
     )
 

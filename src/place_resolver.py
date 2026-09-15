@@ -9,7 +9,7 @@ incident).
 import argparse
 import json
 
-from onemap import search_location, search_places
+from onemap import search_location, search_places, OneMapError, onemap_error_reason
 
 
 def main():
@@ -48,11 +48,17 @@ def main():
     except ValueError as error:
         emit_error("near_not_found", str(error))
         return
+    except OneMapError as error:
+        emit_error(onemap_error_reason(error), str(error))
+        return
 
     try:
         candidates = search_places(args.query, near, limit=args.limit)
     except ValueError as error:
         emit_error("place_not_found", str(error))
+        return
+    except OneMapError as error:
+        emit_error(onemap_error_reason(error), str(error))
         return
 
     result = {

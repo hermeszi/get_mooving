@@ -12,7 +12,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-from onemap import search_location
+from onemap import search_location, OneMapError, onemap_error_reason
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -73,6 +73,9 @@ def main():
             resolved = search_location(args.address)
         except ValueError as error:
             emit_error("location_not_found", str(error))
+            return
+        except OneMapError as error:
+            emit_error(onemap_error_reason(error), str(error))
             return
 
         profile["location"] = {

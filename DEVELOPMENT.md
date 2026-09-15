@@ -1102,6 +1102,11 @@ There is currently no way to feed a user-supplied destination back into `planner
 - [x] same-point (start = destination) trips fixed to return 0 minutes instead of crashing (§48, `onemap.py`)
 - [x] location freshness now also checks against a calendar event in progress, not just a timestamp (§49, `location_state.py`/`get_current_event`)
 - [x] `schedule_milestones.py` corrects already-scheduled reminders when the computed time drifts, instead of leaving them stale (§49)
+- [x] owner's own address auto-trusted in both email-check scripts, not just the connected account (§50)
+- [x] README rewritten as a full OpenClaw-beginner operator's guide — file structure, gateway basics, both automations, model/cost (§50)
+- [x] docs split into README.md (hub) / SETUP.md / OPERATING.md — DEVELOPMENT.md and Get_Mooving.md deliberately left as single files (§51)
+- [x] malformed `confirmed_at` timestamps no longer crash freshness checks (§52, `location_state.py`)
+- [x] every OneMap failure (missing token, HTTP error, network error, and the search endpoint's 200-with-error-body case) now surfaces as a structured `OneMapError`, and every script that calls OneMap catches it and prints clean `{"error", "message"}` JSON instead of a raw traceback (§52, `onemap.py` + all 5 callers)
 
 ### Still being developed
 
@@ -2395,7 +2400,79 @@ Real travel time from the class, not the degenerate same-point trip from §48 �
 
 ---
 
-## 50. Development Principles Learned
+## 50. Owner Email Was a Silent Trust Gap, and a Full Operator's Guide
+
+Two unrelated but well-timed catches: a real code inconsistency, and the README was still written for someone who already knows OpenClaw.
+
+### `trusted_emails` didn't include the owner's own address
+
+Spotted directly in the code: `profile.json` explicitly names an address as the owner (`notify_email`), but `gmail_check_inbox.py`'s trust set only ever included `my_email` (the connected Gmail account itself) — never `owner_email`, even though the same function already computed it for the `is_owner` field two lines below. `gmail_check_replies.py` had the identical gap. In this project's own setup the two addresses happened to be manually duplicated into `trusted_contacts.json`, so the bug was invisible — but that's exactly the footgun: change `notify_email` without remembering to update `trusted_contacts.json` too, and the owner's own address silently stops being trusted. Fixed in both files: `{my_email, owner_email}`, matching the reasoning already applied to the connected account itself — the owner already controls `trusted_contacts.json` directly, so auto-trusting their own configured address grants no new capability, it just removes a pointless duplication requirement.
+
+### README rewritten for someone who has never used OpenClaw
+
+The previous version assumed OpenClaw fluency it never actually established. Rewritten with:
+
+- A **file structure** section, cross-checked line-by-line against the real repo (`ls src/*.py`, `ls data/*.json`) rather than written from memory.
+- **OpenClaw basics** — `gateway status/start/restart/stop`, background service vs. foreground (`gateway run`, not bare `gateway` — the earlier draft had this wrong), `doctor`, `logs --follow`.
+- A **daily routine** section matching the actual start/edit/test/stop cycle.
+- The **two automations** needed for real proactive behavior (milestone scheduling — cheap, a command payload — and email polling — a real agent turn, not cheap), with interval guidance (2m testing / 10m normal / 15m low-priority) and full lifecycle management (`list --all`, `run <id> --wait`, `runs <id>`, `disable`/`enable`/`rm`).
+- A **model and cost** section: current default, how to check/list/switch, and — pointing back at §29 — an explicit warning that a cheaper model isn't just slower, it silently failed at the one thing this project depends on (reliably dispatching to the real scripts instead of hallucinating), so a cost-driven switch needs to be verified, not trusted blindly.
+
+Every command in the automations and OpenClaw-basics sections was checked against `--help` output before being written down, catching real inaccuracies in the source material along the way:
+
+- `openclaw automations remove` doesn't exist — it's `rm`.
+- Foreground mode is `openclaw gateway run`, not bare `openclaw gateway`.
+- `openclaw skills remove get-mooving` (in the *previous* version of this README, written earlier this session) doesn't exist either — `skills --help` has no removal command at all for a workspace-installed skill like this one. `skills library remove` exists but is explicitly for a different installation path ("Workspace installs remain under skills install," per the CLI's own text) and doesn't apply here. Corrected to the actual mechanism: delete `~/.openclaw/workspace/skills/get-mooving` directly.
+- `openclaw gateway usage-cost --all-agents` exists and is documented, but tested against this real session's (substantial) usage and returned `$0.0000` — this project bills through OpenRouter directly, so real spend is only visible on OpenRouter's own dashboard, not this local counter. Said so plainly rather than presenting a command that looks authoritative but isn't for this setup.
+
+---
+
+## 51. Documentation Split — README/SETUP/OPERATING
+
+By §50, `README.md` had grown to cover first-time setup, OpenClaw basics, daily routine, both automations, and model/cost all in one file — the exact same "one file trying to be a manual for everything" shape `SKILL.md` had in §45, just one level up. Asked directly whether splitting made sense.
+
+Answered by distinguishing two different kinds of long documents, not just reflexively splitting everything: `DEVELOPMENT.md` is a chronological decision log where the value *is* the linear narrative — splitting it would break the "why" trail between sections that reference each other by number. `Get_Mooving.md` is a read-once pitch, not something navigated repeatedly. Neither has the problem `README.md` had, which was genuinely mixed audiences at genuinely different times: "read once during setup" content sitting next to "look up weekly" operational content.
+
+Split, moving content rather than rewriting it (so nothing already-verified got silently altered in the move):
+
+- **`README.md`** — trimmed to what it should have been: what it does, a links table to the other three docs, and the disconnect/privacy table (kept here deliberately, not moved — "how do I get out" should be findable in the one file everyone opens first, not buried in a doc someone only reaches after already being fully set up).
+- **`SETUP.md`** — file structure through installing the skill (previously README §s 1–7). Ends with a forward pointer to OPERATING.md.
+- **`OPERATING.md`** — OpenClaw basics, daily routine, using it, both automations, model/cost. Ends with pointers back to README (privacy) and DEVELOPMENT.md (why).
+
+`DEVELOPMENT.md`'s own "Approximate Repo Structure" snapshot (§54) updated to list the three files — a current-state reference, unlike the surrounding historical sections which correctly stayed untouched (they describe README as it was *at the time each entry was written*, not as it is now).
+
+---
+
+## 52. Two Correctness Gaps Found by Live Testing, Not Code Review
+
+The user read `location_state.py` and `onemap.py`/`planner.py` closely enough to spot two places where the code's own stated contract didn't hold — then asked for each to be proven with a failing test before being fixed, rather than just fixed on inspection.
+
+**Gap 1 — `is_location_fresh()`'s docstring lied.** It said "Missing or unparsable timestamps are never fresh," but `datetime.fromisoformat(confirmed_at)` had no exception handling, so a corrupted `confirmed_at` (e.g. `"garbage"`) would crash instead of returning `False`. Confirmed with the user's exact assertion — `assert is_location_fresh("garbage", now) is False` — which failed before the fix and passes after. Fixed by wrapping the parse in `try/except (ValueError, TypeError): return False`. Also covers `None`, `""`, and a non-string input, none of which should ever reach this function in practice but shouldn't crash it either.
+
+**Gap 2 — SKILL.md's "every script prints one JSON object, failures are `{"error", "message"}`" contract wasn't actually enforced at the Python layer for OneMap failures.** `planner.py` (and the other four scripts calling into `onemap.py`) only caught `ValueError` around location searches — OneMap's "not found" case — but nothing caught a missing token, an HTTP error from `raise_for_status()`, a network/timeout failure, or covered the routing call at all. Since `SETUP.md` already documents that `ONEMAP_TOKEN` expires roughly every 3 days, this wasn't a hypothetical: it's the single most likely real-world failure mode of the whole system, and it was producing raw Python tracebacks instead of a message the LLM layer could act on ("refresh the token").
+
+Tested deliberately with the project's real `.env` token, which — not simulated, discovered mid-testing — happened to actually be expired at the time. Live testing surfaced something a status-code-only fix would have missed: OneMap's two endpoints don't fail the same way. The routing endpoint (`ROUTE_URL`) returns a real HTTP 401. The search/geocoding endpoint (`SEARCH_URL`) returns **HTTP 200** with the error described inside the JSON body (`{"error": "Authentication token expired..."}`) — `raise_for_status()` never fires for it at all.
+
+Fixed by giving `onemap.py` a small exception hierarchy and two enforcement points instead of patching each call site ad hoc:
+
+- `OneMapError` (base) → `OneMapAuthError` (missing/expired/invalid token) and `OneMapUnavailableError` (everything else — network, timeout, other HTTP errors).
+- `_get()`: the one function every OneMap network call now goes through. Converts `get_headers()`'s missing-token case, any `HTTPError` (401/403 → auth, else → unavailable), and any `RequestException` into the structured exceptions — nothing above it ever sees a raw `requests` exception.
+- `_raise_for_data_error()`: classifies the search endpoint's 200-with-error-body case by checking the message text for auth-related keywords (`token`, `auth`, `unauthorized`, `unauthorised`), since no HTTP status is available to key off there.
+- `onemap_error_reason(error)`: the one place that turns a caught `OneMapError` into the `--json` `"error"` code (`"onemap_auth_failed"` / `"onemap_unavailable"`), reused by every caller instead of each one re-implementing the `isinstance` check.
+
+Every script that calls into `onemap.py` (`planner.py`, `late_recovery.py`, `route_compare.py`, `update_location.py`, `place_resolver.py`) now catches `OneMapError` alongside its existing `ValueError` catches, and `planner.py`/`late_recovery.py`/`route_compare.py` also wrap their previously-unwrapped travel-time/routing calls. Verified against the real expired token end to end — `./run_planner.sh --json` now returns:
+
+```json
+{"error": "onemap_auth_failed", "message": "OneMap authentication failed: Authentication token expired. Token is valid for 3 days. Please implement automatic renewal to ensure your token remains valid."}
+```
+
+instead of a traceback — and the same clean-JSON behavior was confirmed for all five scripts, not just the planner. Also confirmed `update_location.py --address` fails without corrupting `profile.json` — the OneMap error is raised before `save_profile()` is ever reached, so a bad token can't silently write a half-applied location change.
+
+**Rule for next time:** a docstring's stated contract ("never fresh," "always returns error+message") is a testable claim, not documentation — the two bugs here both existed silently until someone actually tried the exact input the contract promised to handle.
+
+---
+
+## 53. Development Principles Learned
 
 ### Test one layer at a time
 
@@ -2456,11 +2533,13 @@ Gmail unavailable
 
 ---
 
-## 51. Approximate Repo Structure
+## 54. Approximate Repo Structure
 
 ```text
 get_mooving/
-├── README.md
+├── README.md               short overview + links (§51)
+├── SETUP.md                first-time install (§51)
+├── OPERATING.md            day-to-day use, automations, model/cost (§51)
 ├── Get_Mooving.md
 ├── requirements.txt
 ├── run_planner.sh
@@ -2505,7 +2584,7 @@ get_mooving/
 
 ---
 
-## 52. Short Development Summary
+## 55. Short Development Summary
 
 The prototype grew in this order:
 

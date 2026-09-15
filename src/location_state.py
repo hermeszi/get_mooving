@@ -30,7 +30,10 @@ def is_location_fresh(confirmed_at: str, now: datetime) -> bool:
     if not confirmed_at:
         return False
 
-    confirmed_time = datetime.fromisoformat(confirmed_at)
+    try:
+        confirmed_time = datetime.fromisoformat(confirmed_at)
+    except (ValueError, TypeError):
+        return False
 
     return now - confirmed_time < FRESHNESS_LIMIT
 

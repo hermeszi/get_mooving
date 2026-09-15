@@ -60,7 +60,11 @@ def check_inbox() -> list:
 
     my_email = service.users().getProfile(userId="me").execute()["emailAddress"].lower()
     owner_email = (load_json("profile.json").get("notify_email") or "").lower()
-    trusted_emails = load_trusted_emails() | {my_email}
+    # profile.json explicitly names owner_email as the owner — trusting
+    # it automatically, same as the connected account itself, avoids
+    # the footgun of it silently not being trusted unless also
+    # duplicated into trusted_contacts.json by hand.
+    trusted_emails = load_trusted_emails() | {my_email, owner_email}
 
     watched_thread_ids = {entry["thread_id"] for entry in load_watched_threads()}
 

@@ -10,7 +10,13 @@ import json
 from datetime import datetime, timedelta
 
 from calendar_google import get_next_event, get_current_event
-from onemap import search_location, get_public_transport_time, get_drive_time
+from onemap import (
+    search_location,
+    get_public_transport_time,
+    get_drive_time,
+    OneMapError,
+    onemap_error_reason,
+)
 from location_state import needs_confirmation, location_confirmation_prompt
 from planner import load_json, format_time, format_24h
 
@@ -104,15 +110,25 @@ def main():
     except ValueError as error:
         emit_error("start_location_not_found", str(error))
         return
+    except OneMapError as error:
+        emit_error(onemap_error_reason(error), str(error))
+        return
 
     try:
         destination = search_location(event["location"])
     except ValueError as error:
         emit_error("destination_not_found", str(error))
         return
+    except OneMapError as error:
+        emit_error(onemap_error_reason(error), str(error))
+        return
 
-    transit_minutes = get_public_transport_time(start_location, destination, now)
-    drive_minutes = get_drive_time(start_location, destination, now)
+    try:
+        transit_minutes = get_public_transport_time(start_location, destination, now)
+        drive_minutes = get_drive_time(start_location, destination, now)
+    except OneMapError as error:
+        emit_error(onemap_error_reason(error), str(error))
+        return
 
     options = [
         ("public_transport", now + timedelta(minutes=transit_minutes)),
