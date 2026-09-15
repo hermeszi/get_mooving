@@ -1107,6 +1107,8 @@ There is currently no way to feed a user-supplied destination back into `planner
 - [x] docs split into README.md (hub) / SETUP.md / OPERATING.md — DEVELOPMENT.md and Get_Mooving.md deliberately left as single files (§51)
 - [x] malformed `confirmed_at` timestamps no longer crash freshness checks (§52, `location_state.py`)
 - [x] every OneMap failure (missing token, HTTP error, network error, and the search endpoint's 200-with-error-body case) now surfaces as a structured `OneMapError`, and every script that calls OneMap catches it and prints clean `{"error", "message"}` JSON instead of a raw traceback (§52, `onemap.py` + all 5 callers)
+- [x] a real `pytest` unit test suite — 46 tests across 7 files, covering the deterministic core and every previously-found real bug as a regression test, run with everything external mocked (§53, `tests/`)
+- [x] testing formally split into three levels (unit / integration smoke / user flow), documented in `TESTING.md`, with CI running Level 1 only (§53, `.github/workflows/tests.yml`)
 
 ### Still being developed
 
@@ -2439,7 +2441,7 @@ Split, moving content rather than rewriting it (so nothing already-verified got 
 - **`SETUP.md`** — file structure through installing the skill (previously README §s 1–7). Ends with a forward pointer to OPERATING.md.
 - **`OPERATING.md`** — OpenClaw basics, daily routine, using it, both automations, model/cost. Ends with pointers back to README (privacy) and DEVELOPMENT.md (why).
 
-`DEVELOPMENT.md`'s own "Approximate Repo Structure" snapshot (§54) updated to list the three files — a current-state reference, unlike the surrounding historical sections which correctly stayed untouched (they describe README as it was *at the time each entry was written*, not as it is now).
+`DEVELOPMENT.md`'s own "Approximate Repo Structure" snapshot (§55) updated to list the three files — a current-state reference, unlike the surrounding historical sections which correctly stayed untouched (they describe README as it was *at the time each entry was written*, not as it is now).
 
 ---
 
@@ -2472,7 +2474,41 @@ instead of a traceback — and the same clean-JSON behavior was confirmed for al
 
 ---
 
-## 53. Development Principles Learned
+## 53. A Real Unit Test Suite, and Splitting Testing Into Three Levels
+
+By §52, testing meant reading the code closely and trying real inputs by hand — effective (it caught two real bugs), but nothing stopped either bug from coming back silently on a future change, and nothing ran automatically. Asked directly to build a small `pytest` suite, starting with the pure calculation core.
+
+**Where the tests live and what they cover.** `tests/` mirrors the module list, one file per script that has meaningfully testable logic:
+
+- `test_planner.py` — `calculate_plan()` against the project's original worked example (meeting 15:00, 48 min travel → wrap up 13:29, get ready 13:39, leave 13:54, physical departure 14:02, arrival 14:50), plus a zero-buffers collapse case and an ordering invariant. This function is the foundation everything else's timing depends on, and it's pure — no I/O, so no mocking needed.
+- `test_location_state.py` — fresh/stale/missing/invalid timestamps, same/different postal code, no current event. The invalid-timestamp case pins down the §52 crash directly as a regression test.
+- `test_onemap.py` — `_extract_minutes()`, `_same_point()`, the postal-code search fallback, and every OneMap failure mode from §52 (missing token, HTTP error, HTTP 401, and the search endpoint's 200-with-error-body case) — `requests.get` mocked throughout, so this file makes zero real network calls and doesn't care whether `ONEMAP_TOKEN` is valid, expired, or absent.
+- `test_calendar_google.py` — skips all-day events, skips an already-started event (the §47 bug, now a regression test), finds the currently-in-progress event — the Google API `service` object mocked, no real Calendar account touched.
+- `test_late_recovery.py` — `lateness_minutes()`/`build_result()`, pure.
+- `test_schedule_milestones.py` — add / don't duplicate / reschedule-if-stale / ignore-past-milestones, with `resolve_plan()` and `subprocess.run()` both mocked so `existing_jobs()`'s own dedupe logic (§?, "confirmed by testing" that `--declaration-key` doesn't dedupe on its own) is what's actually under test, not `openclaw` itself.
+- `test_gmail_safety.py` — `extract_address()` against a deliberately spoofed header (`"trusted@x.com" <attacker@evil.com>"` must resolve to the attacker's real address, not the display name), plus `load_trusted_emails()` reading/lowercasing a temp allowlist file.
+
+46 tests, all passing, confirmed to run correctly even with the process environment stripped entirely (`env -i`) — proving Level 1 genuinely has no hidden dependency on the real `.env`, `data/profile.json`, or Google/OneMap credentials being present.
+
+**Three levels, not one**, matching how this project was already being tested informally — made explicit so the fast layer runs constantly and the slow layer stays deliberate:
+
+```
+LEVEL 1 — unit tests (pytest, no network, runs in CI)
+        ↓
+LEVEL 2 — integration smoke test (real Calendar/OneMap/Gmail, run before a demo)
+        ↓
+LEVEL 3 — user flow (talk to the agent through OpenClaw, check wording too)
+```
+
+Level 1 is where nearly every bug in this project has actually been found so far — a wrong buffer calculation, a crash on bad input, an uncaught exception type — none of which need a real account to catch. Level 2 exists because Level 1 mocks the outside world, and the outside world genuinely drifts under this project specifically (the 3-day OneMap token expiry being the clearest example). Level 3 exists because `SKILL.md` makes wording/judgment calls no Python test can evaluate.
+
+**CI runs Level 1 only, deliberately** — added as `.github/workflows/tests.yml` (checkout → install `requirements-dev.txt` → `python -m compileall src` → `pytest -v`), triggered on push/PR to `main`. GitHub Actions is never handed real Google/OneMap credentials just to make a smoke test pass; nothing Level 2 or 3 needs is committed to the repo (confirmed against `.gitignore`), and that boundary is treated as a rule, not an oversight to fix later.
+
+Documented in a new **`TESTING.md`**, including a short vocabulary section (unit test, mock, regression test, smoke test, integration test, end-to-end test, coverage) — written for someone who hasn't necessarily used any of these terms before, matching how `SETUP.md`/`OPERATING.md` were written for an OpenClaw beginner rather than assuming prior context.
+
+---
+
+## 54. Development Principles Learned
 
 ### Test one layer at a time
 
@@ -2533,18 +2569,35 @@ Gmail unavailable
 
 ---
 
-## 54. Approximate Repo Structure
+## 55. Approximate Repo Structure
 
 ```text
 get_mooving/
 ├── README.md               short overview + links (§51)
 ├── SETUP.md                first-time install (§51)
 ├── OPERATING.md            day-to-day use, automations, model/cost (§51)
+├── TESTING.md              unit/smoke/user-flow levels, what's covered (§53)
 ├── Get_Mooving.md
 ├── requirements.txt
+├── requirements-dev.txt    pytest + pytest-mock, on top of requirements.txt (§53)
+├── pytest.ini
 ├── run_planner.sh
 ├── .gitignore
 ├── .env.example
+│
+├── .github/
+│   └── workflows/
+│       └── tests.yml       CI: compileall + pytest, Level 1 only (§53)
+│
+├── tests/
+│   ├── conftest.py
+│   ├── test_planner.py
+│   ├── test_location_state.py
+│   ├── test_onemap.py
+│   ├── test_calendar_google.py
+│   ├── test_late_recovery.py
+│   ├── test_schedule_milestones.py
+│   └── test_gmail_safety.py
 │
 ├── data/
 │   ├── mock_calendar.json
@@ -2584,7 +2637,7 @@ get_mooving/
 
 ---
 
-## 55. Short Development Summary
+## 56. Short Development Summary
 
 The prototype grew in this order:
 

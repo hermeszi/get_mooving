@@ -1,0 +1,5 @@
+# Level 1 (unit test) dependencies only — see TESTING.md.
+# CI installs this file; it never needs real Google/OneMap credentials.
+-r requirements.txt
+pytest==9.1.1
+pytest-mock==3.15.1

@@ -15,6 +15,7 @@ Reads your next Google Calendar event, works out real Singapore travel time (One
 | **[SETUP.md](SETUP.md)** | First-time install: file structure, dependencies, Google/OneMap accounts, profile config, installing the skill |
 | **[OPERATING.md](OPERATING.md)** | Day-to-day use: OpenClaw basics, daily routine, the two proactive automations, model/cost |
 | **[DEVELOPMENT.md](DEVELOPMENT.md)** | The *why* behind every decision, in chronological order — read this before changing how something works |
+| **[TESTING.md](TESTING.md)** | How this project is tested — unit/smoke/user-flow levels, what's covered, how CI runs |
 | **[Get_Mooving.md](Get_Mooving.md)** | The original product pitch and design |
 
 New here? Start with **[SETUP.md](SETUP.md)**.
